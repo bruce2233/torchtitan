@@ -20,6 +20,12 @@ from torch.fx.traceback import preserve_node_meta
 from torch.nn.utils import stateless
 from torch.utils._python_dispatch import is_traceable_wrapper_subclass
 
+from torchtitan.experiments.graph_trainer.dynamic_shapes import (
+    _fakeify_input,
+    _insert_runtime_asserts,
+    _wrapper_subclass_has_mark_unbacked,
+)
+
 # Tensors and make_fx-safe primitives are allowed as pytree leaves in args.
 # Everything else (callables, custom objects) should be registered as pytree
 # nodes/constants or captured in fn's closure.
@@ -82,7 +88,8 @@ def _unwrap_subclass(t: torch.Tensor) -> tuple[list[torch.Tensor], SubclassMeta 
 
 
 def _wrap_to_subclass(
-    plain_tensors: list[torch.Tensor], meta: SubclassMeta
+    plain_tensors: list[torch.Tensor],
+    meta: SubclassMeta,
 ) -> torch.Tensor:
     inner_dict = {}
     idx = 0
@@ -94,8 +101,12 @@ def _wrap_to_subclass(
             inner_dict[attr] = inner_tensors[0]
         else:
             inner_dict[attr] = _wrap_to_subclass(list(inner_tensors), inner_meta)
+
     return meta.cls.__tensor_unflatten__(
-        inner_dict, meta.ctx, meta.outer_size, meta.outer_stride
+        inner_dict,
+        meta.ctx,
+        meta.outer_size,
+        meta.outer_stride,
     )
 
 
@@ -356,20 +367,33 @@ def minimal_fx_tracer(fn: Callable) -> Callable[..., TracedResult]:
         # Combined flat input: [*state, *user_args] with subclasses unwrapped.
         full_args = list(state_flat) + list(user_args_flat)
         num_full_args = len(full_args)
+        for arg in full_args:
+            if not isinstance(arg, torch.Tensor):
+                continue
+            if getattr(arg, "_dynamo_dynamic_indices", None) or getattr(
+                arg, "_dynamo_dynamic_range", None
+            ):
+                raise ValueError("minimal_fx_tracer only supports mark_unbacked()")
+            if _wrapper_subclass_has_mark_unbacked(arg):
+                raise ValueError(
+                    "minimal_fx_tracer only supports mark_unbacked() on plain tensor "
+                    "inputs; wrapper subclasses such as DTensor are not supported"
+                )
         unwrapped_args, input_layouts = _unwrap_subclasses(full_args)
 
         fake_mode = FakeTensorMode(
             allow_non_fake_inputs=True,
-            shape_env=torch.fx.experimental.symbolic_shapes.ShapeEnv(),
+            shape_env=torch.fx.experimental.symbolic_shapes.ShapeEnv(
+                tracked_fakes=[],
+            ),
         )
-        fake_args = tuple(
-            (
-                fake_mode.from_tensor(a, static_shapes=True)
+        with fake_mode.shape_env.ignore_fresh_unbacked_symbols():
+            fake_args = tuple(
+                _fakeify_input(fake_mode, a, input_name=f"minimal_fx_tracer_input_{i}")
                 if isinstance(a, torch.Tensor)
                 else a
+                for i, a in enumerate(unwrapped_args)
             )
-            for a in unwrapped_args
-        )
 
         output_layouts: dict[int, SubclassLayout] = {}
         num_flat_outputs: int = 0
@@ -428,6 +452,7 @@ def minimal_fx_tracer(fn: Callable) -> Callable[..., TracedResult]:
         _copy_fwd_metadata_to_bw_nodes(traced)
 
         _remove_cpu_shadow_chains(traced)
+        _insert_runtime_asserts(traced, fake_mode)
 
         assert output_spec is not None
         return TracedResult(
