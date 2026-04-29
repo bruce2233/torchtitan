@@ -355,15 +355,15 @@ def _precompile_aot_fx_trace(
                 inner_attention,
                 (FlexAttention.Config, VarlenAttention.Config),
             ):
-                assert (
-                    tokenizer is not None
-                ), "tokenizer is required for flex/varlen attention"
+                positions = extra_kwargs.get("positions")
+                if positions is None:
+                    raise ValueError(
+                        "positions are required for flex/varlen attention masks"
+                    )
                 extra_kwargs["attention_masks"] = cast(
                     Decoder, model
                 ).get_attention_masks(
-                    input_batch=dummy_inputs,
-                    tokenizer=tokenizer,
-                    extra_inputs=extra_inputs or {},
+                    positions=positions,
                 )
 
     # TODO: Add CP support — call prepare_context_parallel_input here
