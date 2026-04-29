@@ -351,6 +351,21 @@ def _build_llama3_tests() -> list[OverrideDefinitions]:
             ngpu=8,
             skip_rocm_test=True,
         ),
+        # Single-GPU run exercises the code path where all DP/CP dims are 1;
+        # simple_fsdp must still be applied so mixed-precision param cast runs.
+        OverrideDefinitions(
+            [
+                [
+                    "--module graph_trainer.llama3",
+                    "--config graph_trainer_llama3_debugmodel",
+                    "--compile.mode aot_fx_trace",
+                ],
+            ],
+            "aot_fx_trace llama3 single-GPU",
+            "aot_fx_trace_llama3_single_gpu",
+            ngpu=1,
+            skip_rocm_test=True,
+        ),
     ]
 
 
@@ -512,6 +527,21 @@ def _build_deepseek_v3_tests() -> list[OverrideDefinitions]:
             "aot_fx_trace deepseek_v3 FSDP+TP+EP+FlexAttn",
             "aot_fx_trace_deepseek_v3_fsdp_tp_ep_flexattn",
             ngpu=8,
+        ),
+        # Single-GPU run exercises the code path where all DP/CP/EP dims are 1;
+        # simple_fsdp must still be applied so mixed-precision param cast runs.
+        # Uses the non-EP debugmodel since EP requires degree > 1.
+        OverrideDefinitions(
+            [
+                [
+                    "--module graph_trainer.deepseek_v3",
+                    "--config graph_trainer_deepseek_v3_debugmodel",
+                    "--compile.mode aot_fx_trace",
+                ],
+            ],
+            "aot_fx_trace deepseek_v3 single-GPU",
+            "aot_fx_trace_deepseek_v3_single_gpu",
+            ngpu=1,
         ),
     ]
 
