@@ -157,7 +157,7 @@ class TestParallelDimsValidation(unittest.TestCase):
         self.assertTrue(parallel_dims.dp_cp_enabled)
         self.assertTrue(parallel_dims.fsdp_enabled)
 
-        # Test with EP and ETP enabled (EP * ETP must not contribute to world_size)
+        # Test with EP enabled (EP must not contribute to world_size)
         parallel_dims = ParallelDims(
             dp_replicate=1,
             dp_shard=2,
@@ -261,12 +261,12 @@ class TestParallelDimsMeshOperations(unittest.TestCase):
             world_size=1,
         )
         # Don't call build_mesh explicitly
-        self.assertEqual(len(parallel_dims._meshes), 0)
+        self.assertEqual(len(parallel_dims._single_axis_meshes), 0)
 
         # get_optional_mesh should trigger build_mesh
         result = parallel_dims.get_optional_mesh("tp")
         # Result is None because tp has size 1, but build_mesh should have been called
-        self.assertGreater(len(parallel_dims._meshes), 0)
+        self.assertGreater(len(parallel_dims._single_axis_meshes), 0)
 
     @patch("torchtitan.distributed.parallel_dims.device_type", "cpu")
     def test_single_rank_mesh_operations(self):
@@ -291,25 +291,25 @@ class TestParallelDimsMeshOperations(unittest.TestCase):
         self.assertEqual(world_mesh.size(), 1)
 
         # Verify all expected meshes are created
-        self.assertIsNotNone(parallel_dims._meshes)
-        self.assertIn("pp", parallel_dims._meshes)
-        self.assertIn("batch", parallel_dims._meshes)
-        self.assertIn("loss", parallel_dims._meshes)
-        self.assertIn("dp_replicate", parallel_dims._meshes)
-        self.assertIn("fsdp", parallel_dims._meshes)
-        self.assertIn("cp", parallel_dims._meshes)
-        self.assertIn("tp", parallel_dims._meshes)
+        self.assertIsNotNone(parallel_dims._single_axis_meshes)
+        self.assertIn("pp", parallel_dims._single_axis_meshes)
+        self.assertIn("batch", parallel_dims._single_axis_meshes)
+        self.assertIn("loss", parallel_dims._single_axis_meshes)
+        self.assertIn("dp_replicate", parallel_dims._single_axis_meshes)
+        self.assertIn("fsdp", parallel_dims._single_axis_meshes)
+        self.assertIn("cp", parallel_dims._single_axis_meshes)
+        self.assertIn("tp", parallel_dims._single_axis_meshes)
 
         # Validate 1D mesh sizes - all should be 1 for single rank
-        self.assertEqual(parallel_dims._meshes["dp_replicate"].size(), 1)
-        self.assertEqual(parallel_dims._meshes["fsdp"].size(), 1)
-        self.assertEqual(parallel_dims._meshes["tp"].size(), 1)
-        self.assertEqual(parallel_dims._meshes["batch"].size(), 1)
-        self.assertEqual(parallel_dims._meshes["loss"].size(), 1)
-        self.assertEqual(parallel_dims._meshes["pp"].size(), 1)
-        self.assertEqual(parallel_dims._meshes["cp"].size(), 1)
-        self.assertEqual(parallel_dims._meshes["ep"].size(), 1)
-        self.assertEqual(parallel_dims._meshes["efsdp"].size(), 1)
+        self.assertEqual(parallel_dims._single_axis_meshes["dp_replicate"].size(), 1)
+        self.assertEqual(parallel_dims._single_axis_meshes["fsdp"].size(), 1)
+        self.assertEqual(parallel_dims._single_axis_meshes["tp"].size(), 1)
+        self.assertEqual(parallel_dims._single_axis_meshes["batch"].size(), 1)
+        self.assertEqual(parallel_dims._single_axis_meshes["loss"].size(), 1)
+        self.assertEqual(parallel_dims._single_axis_meshes["pp"].size(), 1)
+        self.assertEqual(parallel_dims._single_axis_meshes["cp"].size(), 1)
+        self.assertEqual(parallel_dims._single_axis_meshes["ep"].size(), 1)
+        self.assertEqual(parallel_dims._single_axis_meshes["efsdp"].size(), 1)
 
         # Validate 2D mesh shapes
         dp_replicate_fsdp_mesh = parallel_dims.get_optional_mesh(
@@ -361,7 +361,7 @@ class TestParallelDimsMeshOperations(unittest.TestCase):
     @patch("torchtitan.distributed.parallel_dims.device_type", "cpu")
     def test_expert_parallelism_validation(self):
         """Test expert parallelism configurations."""
-        # EP with ETP = 1 (valid) - world_size = dp_replicate * dp_shard * cp * tp * pp
+        # EP enabled (valid) - world_size = dp_replicate * dp_shard * cp * tp * pp
         parallel_dims = ParallelDims(
             dp_replicate=1,
             dp_shard=2,
@@ -386,6 +386,87 @@ class TestParallelDimsMeshOperations(unittest.TestCase):
         self.assertTrue(parallel_dims.ep_enabled)
         self.assertTrue(parallel_dims.dp_replicate_enabled)
         self.assertTrue(parallel_dims.dp_shard_enabled)
+
+
+class TestSpmdMeshesAndModuleMeshLegacy(DTensorTestBase):
+    """spmd_meshes() and get_module_mesh() under non-full_dtensor."""
+
+    @property
+    def world_size(self):
+        return 8
+
+    @with_comms
+    def test_legacy_spmd_meshes_and_get_module_mesh(self):
+        with patch(
+            "torchtitan.distributed.parallel_dims.device_type", self.device_type
+        ):
+            pd = ParallelDims(
+                dp_replicate=2,
+                dp_shard=2,
+                cp=1,
+                tp=2,
+                pp=1,
+                ep=1,
+                world_size=8,
+                full_dtensor=False,
+            )
+            pd.build_mesh()
+
+            # Legacy mode pre-flattens dp_shard+cp into 'fsdp'; dp_shard
+            # never appears as a single-axis mesh, so must not appear in any
+            # SPMD mesh either.
+            meshes = pd.spmd_meshes()
+            flat = {axis for m in meshes for axis in (m.mesh_dim_names or ())}
+            self.assertNotIn("dp_shard", flat)
+            # Dense mesh: dp_replicate and tp enabled; cp disabled (size 1).
+            dense = next(m for m in meshes if "tp" in (m.mesh_dim_names or ()))
+            self.assertEqual(set(dense.mesh_dim_names), {"dp_replicate", "tp"})
+
+            # get_module_mesh under non-full_dtensor filters to {tp, ep}.
+            # A DP-only request is filtered out -> None.
+            self.assertIsNone(pd.get_module_mesh(["dp_replicate"]))
+            # Mixed request: TP survives, dp_replicate filtered out -> 1D TP mesh.
+            mesh = pd.get_module_mesh(["dp_replicate", "tp"])
+            self.assertIsNotNone(mesh)
+            self.assertEqual(mesh.mesh_dim_names, ("tp",))
+
+
+class TestSpmdMeshesAndModuleMeshFullDTensor(DTensorTestBase):
+    """spmd_meshes() and get_module_mesh() under full_dtensor."""
+
+    @property
+    def world_size(self):
+        return 8
+
+    @with_comms
+    def test_full_dtensor_spmd_meshes_and_get_module_mesh(self):
+        with patch(
+            "torchtitan.distributed.parallel_dims.device_type", self.device_type
+        ):
+            pd = ParallelDims(
+                dp_replicate=2,
+                dp_shard=2,
+                cp=1,
+                tp=2,
+                pp=1,
+                ep=1,
+                world_size=8,
+                full_dtensor=True,
+            )
+            pd.build_mesh()
+
+            # Dense mesh keeps dp_shard separate (no 'fsdp' flatten), in
+            # canonical outer-to-inner order; cp filtered out (disabled).
+            meshes = pd.spmd_meshes()
+            dense = next(m for m in meshes if "tp" in (m.mesh_dim_names or ()))
+            self.assertEqual(dense.mesh_dim_names, ("dp_replicate", "dp_shard", "tp"))
+
+            # get_module_mesh keeps DP/CP axes under full_dtensor.
+            mesh = pd.get_module_mesh(["dp_replicate", "dp_shard", "tp"])
+            self.assertIsNotNone(mesh)
+            self.assertEqual(mesh.mesh_dim_names, ("dp_replicate", "dp_shard", "tp"))
+            # Resolved mesh under full_dtensor must be one of the SPMD meshes.
+            self.assertIn(mesh, meshes)
 
 
 class TestParallelDimsWorld8MeshOperations(DTensorTestBase):
@@ -422,34 +503,36 @@ class TestParallelDimsWorld8MeshOperations(DTensorTestBase):
             self.assertEqual(world_mesh.size(), 8)
 
             # Verify all expected meshes are created
-            self.assertIsNotNone(parallel_dims._meshes)
-            self.assertIn("pp", parallel_dims._meshes)
-            self.assertIn("batch", parallel_dims._meshes)
-            self.assertIn("loss", parallel_dims._meshes)
-            self.assertIn("dp_replicate", parallel_dims._meshes)
-            self.assertIn("fsdp", parallel_dims._meshes)
-            self.assertIn("cp", parallel_dims._meshes)
-            self.assertIn("tp", parallel_dims._meshes)
-            self.assertIn("ep", parallel_dims._meshes)
-            self.assertIn("efsdp", parallel_dims._meshes)
+            self.assertIsNotNone(parallel_dims._single_axis_meshes)
+            self.assertIn("pp", parallel_dims._single_axis_meshes)
+            self.assertIn("batch", parallel_dims._single_axis_meshes)
+            self.assertIn("loss", parallel_dims._single_axis_meshes)
+            self.assertIn("dp_replicate", parallel_dims._single_axis_meshes)
+            self.assertIn("fsdp", parallel_dims._single_axis_meshes)
+            self.assertIn("cp", parallel_dims._single_axis_meshes)
+            self.assertIn("tp", parallel_dims._single_axis_meshes)
+            self.assertIn("ep", parallel_dims._single_axis_meshes)
+            self.assertIn("efsdp", parallel_dims._single_axis_meshes)
 
             # Validate 1D mesh sizes match parallelism configuration
-            self.assertEqual(parallel_dims._meshes["pp"].size(), 1)
+            self.assertEqual(parallel_dims._single_axis_meshes["pp"].size(), 1)
             self.assertEqual(
-                parallel_dims._meshes["batch"].size(), 4
+                parallel_dims._single_axis_meshes["batch"].size(), 4
             )  # dp_replicate * dp_shard = 2 * 2
             self.assertEqual(
-                parallel_dims._meshes["loss"].size(), 4
+                parallel_dims._single_axis_meshes["loss"].size(), 4
             )  # dp_replicate * dp_shard * cp = 2 * 2 * 1
-            self.assertEqual(parallel_dims._meshes["dp_replicate"].size(), 2)
             self.assertEqual(
-                parallel_dims._meshes["fsdp"].size(), 2
+                parallel_dims._single_axis_meshes["dp_replicate"].size(), 2
+            )
+            self.assertEqual(
+                parallel_dims._single_axis_meshes["fsdp"].size(), 2
             )  # dp_shard * cp = 2 * 1
-            self.assertEqual(parallel_dims._meshes["cp"].size(), 1)
-            self.assertEqual(parallel_dims._meshes["tp"].size(), 2)
-            self.assertEqual(parallel_dims._meshes["ep"].size(), 1)
+            self.assertEqual(parallel_dims._single_axis_meshes["cp"].size(), 1)
+            self.assertEqual(parallel_dims._single_axis_meshes["tp"].size(), 2)
+            self.assertEqual(parallel_dims._single_axis_meshes["ep"].size(), 1)
             self.assertEqual(
-                parallel_dims._meshes["efsdp"].size(), 4
+                parallel_dims._single_axis_meshes["efsdp"].size(), 4
             )  # fsdp * tp / ep = 2 * 2 / 1 = 4
 
             # Validate 2D mesh shapes
