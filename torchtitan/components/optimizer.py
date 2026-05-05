@@ -28,6 +28,7 @@ from torchtitan.distributed import ParallelDims
 from torchtitan.tools.logging import logger
 
 __all__ = [
+    "MuonAdamW",
     "OptimizersContainer",
     "OptimizersInBackwardContainer",
     "ParamGroupConfig",
@@ -60,6 +61,216 @@ class ParamGroupConfig:
 
 
 T = TypeVar("T", bound=Optimizer)
+
+
+def _zeropower_via_newtonschulz5(
+    grad: torch.Tensor,
+    *,
+    steps: int = 5,
+    eps: float = 1e-7,
+) -> torch.Tensor:
+    """Approximate the orthogonal factor used by Muon for a 2D update."""
+    if grad.ndim != 2:
+        raise ValueError(f"Muon update expects a 2D tensor, got {tuple(grad.shape)}")
+
+    a, b, c = (3.4445, -4.7750, 2.0315)
+    original_dtype = grad.dtype
+    update = grad.to(torch.bfloat16)
+
+    transposed = update.shape[0] > update.shape[1]
+    if transposed:
+        update = update.T
+
+    update = update / (update.norm() + eps)
+    for _ in range(steps):
+        gram = update @ update.T
+        update = a * update + (b * gram + c * gram @ gram) @ update
+
+    if transposed:
+        update = update.T
+    return update.to(original_dtype)
+
+
+class MuonAdamW(Optimizer):
+    """Small single-process Muon + AdamW optimizer.
+
+    Parameters in groups with ``use_muon=True`` receive Muon updates. Other
+    groups use AdamW. The container builds those groups by parameter name so
+    embeddings, tied LM heads, norms, biases, and scalar/vector parameters stay
+    on AdamW while transformer projection matrices use Muon.
+    """
+
+    def __init__(
+        self,
+        params,
+        lr: float = 3e-4,
+        betas: tuple[float, float] = (0.9, 0.95),
+        eps: float = 1e-8,
+        weight_decay: float = 0.1,
+        fused: bool | None = False,
+        foreach: bool | None = False,
+        muon_lr: float | None = None,
+        muon_momentum: float = 0.95,
+        muon_nesterov: bool = True,
+        muon_ns_steps: int = 5,
+        amsgrad: bool = False,
+        maximize: bool = False,
+        capturable: bool = False,
+        differentiable: bool = False,
+    ) -> None:
+        if lr < 0:
+            raise ValueError(f"Invalid learning rate: {lr}")
+        if muon_lr is not None and muon_lr < 0:
+            raise ValueError(f"Invalid Muon learning rate: {muon_lr}")
+        if not 0 <= betas[0] < 1:
+            raise ValueError(f"Invalid beta1: {betas[0]}")
+        if not 0 <= betas[1] < 1:
+            raise ValueError(f"Invalid beta2: {betas[1]}")
+        if eps < 0:
+            raise ValueError(f"Invalid epsilon: {eps}")
+        if not 0 <= muon_momentum < 1:
+            raise ValueError(f"Invalid Muon momentum: {muon_momentum}")
+        if muon_ns_steps < 1:
+            raise ValueError(f"Invalid Muon Newton-Schulz steps: {muon_ns_steps}")
+
+        defaults = dict(
+            lr=lr,
+            betas=betas,
+            eps=eps,
+            weight_decay=weight_decay,
+            fused=fused,
+            foreach=foreach,
+            muon_lr=muon_lr if muon_lr is not None else lr,
+            muon_momentum=muon_momentum,
+            muon_nesterov=muon_nesterov,
+            muon_ns_steps=muon_ns_steps,
+            amsgrad=amsgrad,
+            maximize=maximize,
+            capturable=capturable,
+            differentiable=differentiable,
+            use_muon=False,
+        )
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self, closure: Callable[[], float] | None = None) -> float | None:
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            if group.get("use_muon", False):
+                self._muon_step_group(group)
+            else:
+                self._adamw_step_group(group)
+        return loss
+
+    def _adamw_step_group(self, group: dict[str, Any]) -> None:
+        params_with_grad: list[torch.Tensor] = []
+        grads: list[torch.Tensor] = []
+        exp_avgs: list[torch.Tensor] = []
+        exp_avg_sqs: list[torch.Tensor] = []
+        max_exp_avg_sqs: list[torch.Tensor] = []
+        state_steps: list[torch.Tensor] = []
+        has_complex = False
+        beta1, beta2 = group["betas"]
+
+        for param in group["params"]:
+            if param.grad is None:
+                continue
+            if param.grad.is_sparse:
+                raise RuntimeError("MuonAdamW's AdamW path does not support sparse gradients")
+
+            has_complex |= torch.is_complex(param)
+            params_with_grad.append(param)
+            grads.append(param.grad)
+            state = self.state[param]
+
+            if len(state) == 0:
+                step_device = (
+                    param.device
+                    if group.get("capturable", False) or group.get("fused", False)
+                    else torch.device("cpu")
+                )
+                state["step"] = torch.zeros((), dtype=torch.float32, device=step_device)
+                state["exp_avg"] = torch.zeros_like(
+                    param, memory_format=torch.preserve_format
+                )
+                state["exp_avg_sq"] = torch.zeros_like(
+                    param, memory_format=torch.preserve_format
+                )
+                if group.get("amsgrad", False):
+                    state["max_exp_avg_sq"] = torch.zeros_like(
+                        param, memory_format=torch.preserve_format
+                    )
+
+            exp_avgs.append(state["exp_avg"])
+            exp_avg_sqs.append(state["exp_avg_sq"])
+            if group.get("amsgrad", False):
+                max_exp_avg_sqs.append(state["max_exp_avg_sq"])
+            state_steps.append(state["step"])
+
+        if not params_with_grad:
+            return
+
+        torch.optim._functional.adamw(
+            params_with_grad,
+            grads,
+            exp_avgs,
+            exp_avg_sqs,
+            max_exp_avg_sqs,
+            state_steps,
+            foreach=group.get("foreach", None),
+            capturable=group.get("capturable", False),
+            differentiable=group.get("differentiable", False),
+            fused=group.get("fused", None),
+            grad_scale=None,
+            found_inf=None,
+            has_complex=has_complex,
+            amsgrad=group.get("amsgrad", False),
+            beta1=beta1,
+            beta2=beta2,
+            lr=group["lr"],
+            weight_decay=group["weight_decay"],
+            eps=group["eps"],
+            maximize=group.get("maximize", False),
+        )
+
+    def _muon_step_group(self, group: dict[str, Any]) -> None:
+        lr = group["lr"]
+        momentum = group["muon_momentum"]
+        nesterov = group["muon_nesterov"]
+        ns_steps = group["muon_ns_steps"]
+        weight_decay = group["weight_decay"]
+
+        for param in group["params"]:
+            if param.grad is None:
+                continue
+            if param.grad.is_sparse:
+                raise RuntimeError("MuonAdamW's Muon path does not support sparse gradients")
+            if param.ndim != 2:
+                raise RuntimeError(
+                    f"MuonAdamW received non-2D Muon parameter with shape {tuple(param.shape)}"
+                )
+
+            grad = -param.grad if group.get("maximize", False) else param.grad
+            state = self.state[param]
+            if len(state) == 0:
+                state["momentum_buffer"] = torch.zeros_like(
+                    param, memory_format=torch.preserve_format
+                )
+
+            buf = state["momentum_buffer"]
+            buf.lerp_(grad, 1.0 - momentum)
+            update = grad.lerp(buf, momentum) if nesterov else buf
+            update = _zeropower_via_newtonschulz5(update, steps=ns_steps)
+
+            if weight_decay != 0:
+                param.mul_(1.0 - lr * weight_decay)
+
+            shape_scale = max(1.0, param.shape[0] / param.shape[1]) ** 0.5
+            param.add_(update, alpha=-(lr * shape_scale))
 
 
 # TODO: Right now this class is biased towards AdamW. We should refactor to
@@ -108,6 +319,18 @@ class OptimizersContainer(Optimizer, Stateful, Configurable, Generic[T]):
         weight_decay: float = 0.1
         """Weight decay to use"""
 
+        muon_lr: float | None = None
+        """Learning rate for Muon parameter groups. If None, uses ``lr``."""
+
+        muon_momentum: float = 0.95
+        """Momentum value for Muon parameter groups."""
+
+        muon_nesterov: bool = True
+        """Whether Muon uses Nesterov-style momentum."""
+
+        muon_ns_steps: int = 5
+        """Newton-Schulz iterations for Muon orthogonalization."""
+
         implementation: Literal[
             "for-loop", "foreach", "fused", "fused_opt_states_bf16"
         ] = "fused"
@@ -143,7 +366,11 @@ class OptimizersContainer(Optimizer, Stateful, Configurable, Generic[T]):
 
     @staticmethod
     def _resolve_optimizer_cls(name: str) -> type:
-        optimizer_classes = {"Adam": torch.optim.Adam, "AdamW": torch.optim.AdamW}
+        optimizer_classes = {
+            "Adam": torch.optim.Adam,
+            "AdamW": torch.optim.AdamW,
+            "MuonAdamW": MuonAdamW,
+        }
         if name not in optimizer_classes:
             raise NotImplementedError(f"Optimizer {name} not added.")
         return optimizer_classes[name]
@@ -157,7 +384,7 @@ class OptimizersContainer(Optimizer, Stateful, Configurable, Generic[T]):
             "fused_opt_states_bf16",
         ]
         fused = config.implementation in ("fused", "fused_opt_states_bf16")
-        return {
+        kwargs = {
             "lr": config.lr,
             "betas": (config.beta1, config.beta2),
             "eps": config.eps,
@@ -165,6 +392,86 @@ class OptimizersContainer(Optimizer, Stateful, Configurable, Generic[T]):
             "fused": fused,
             "foreach": config.implementation == "foreach",
         }
+        if config.name == "MuonAdamW":
+            kwargs.update(
+                {
+                    "muon_lr": config.muon_lr if config.muon_lr is not None else config.lr,
+                    "muon_momentum": config.muon_momentum,
+                    "muon_nesterov": config.muon_nesterov,
+                    "muon_ns_steps": config.muon_ns_steps,
+                }
+            )
+        return kwargs
+
+    @staticmethod
+    def _should_use_muon(name: str, param: nn.Parameter) -> bool:
+        if param.ndim != 2:
+            return False
+
+        lowered_name = name.lower()
+        adam_only_tokens = (
+            "tok_embeddings",
+            "embed",
+            "lm_head",
+            "output",
+            "norm",
+            "bias",
+        )
+        if any(token in lowered_name for token in adam_only_tokens):
+            return False
+
+        return any(
+            token in lowered_name
+            for token in ("layers", "attention", "feed_forward", "ffn", "mlp")
+        )
+
+    @staticmethod
+    def _build_muon_adamw_param_groups(
+        model: nn.Module,
+        config: Config,
+        default_kwargs: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        if config.param_groups:
+            logger.warning(
+                "Optimizer param_groups are ignored for MuonAdamW; "
+                "Muon/AdamW split is derived from parameter names and shapes."
+            )
+
+        muon_params = []
+        adamw_params = []
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            if OptimizersContainer._should_use_muon(name, param):
+                muon_params.append(param)
+            else:
+                adamw_params.append(param)
+
+        result = []
+        if adamw_params:
+            result.append(
+                {
+                    "params": adamw_params,
+                    "use_muon": False,
+                    **default_kwargs,
+                }
+            )
+        if muon_params:
+            result.append(
+                {
+                    "params": muon_params,
+                    "use_muon": True,
+                    **default_kwargs,
+                    "lr": default_kwargs["muon_lr"],
+                }
+            )
+
+        logger.info(
+            "MuonAdamW param split: %d Muon tensors, %d AdamW tensors",
+            len(muon_params),
+            len(adamw_params),
+        )
+        return result
 
     @staticmethod
     def _build_param_groups(
@@ -236,7 +543,12 @@ class OptimizersContainer(Optimizer, Stateful, Configurable, Generic[T]):
         self.optimizers = []
         self.model_parts = model_parts
         for model in self.model_parts:
-            param_groups = self._build_param_groups(model, config, optimizer_kwargs)
+            if config.name == "MuonAdamW":
+                param_groups = self._build_muon_adamw_param_groups(
+                    model, config, optimizer_kwargs
+                )
+            else:
+                param_groups = self._build_param_groups(model, config, optimizer_kwargs)
             self.optimizers.append(optimizer_cls(param_groups))
             for group in param_groups:
                 all_params.extend(group["params"])
@@ -366,6 +678,8 @@ class OptimizersInBackwardContainer(OptimizersContainer):
             OptimizersContainer.Config.__post_init__(self)
 
     def __init__(self, config: Config, *, model_parts: list[nn.Module]) -> None:
+        if config.name == "MuonAdamW":
+            raise ValueError("MuonAdamW is not supported with OptimizersInBackwardContainer")
         optimizer_cls = self._resolve_optimizer_cls(config.name)
         optimizer_kwargs = self._build_optimizer_kwargs(config)
         all_params = []

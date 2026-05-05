@@ -10,6 +10,7 @@ import unittest
 import torch
 import torch.nn as nn
 from torchtitan.components.optimizer import (
+    MuonAdamW,
     OptimizersContainer,
     OptimizersInBackwardContainer,
     ParamGroupConfig,
@@ -271,6 +272,47 @@ class TestOptimizersContainerWithParamGroups(unittest.TestCase):
         container = config.build(model_parts=[model])
         opt = container.optimizers[0]
         self.assertEqual(len(opt.param_groups), 1)
+
+    def test_muon_adamw_splits_and_steps(self):
+        """MuonAdamW uses Muon for transformer matrices and AdamW elsewhere."""
+        model = SimpleModel()
+        config = OptimizersContainer.Config(
+            name="MuonAdamW",
+            lr=1e-3,
+            muon_lr=2e-2,
+            weight_decay=0.0,
+            implementation="for-loop",
+        )
+        container = config.build(model_parts=[model])
+        opt = container.optimizers[0]
+
+        self.assertIsInstance(opt, MuonAdamW)
+        self.assertEqual(len(opt.param_groups), 2)
+        adam_group = next(g for g in opt.param_groups if not g["use_muon"])
+        muon_group = next(g for g in opt.param_groups if g["use_muon"])
+
+        adam_names = _get_param_names_in_group(model, adam_group)
+        muon_names = _get_param_names_in_group(model, muon_group)
+
+        self.assertEqual(
+            muon_names,
+            {"layers.0.attention.weight", "layers.0.ff.weight"},
+        )
+        self.assertIn("embed_tokens.weight", adam_names)
+        self.assertIn("output.weight", adam_names)
+        self.assertIn("layers.0.norm.weight", adam_names)
+        self.assertEqual(muon_group["lr"], 2e-2)
+
+        dummy_input = torch.randint(0, 32, (2, 4))
+        output = model(dummy_input)
+        output.sum().backward()
+        container.step()
+
+        for param in muon_group["params"]:
+            self.assertIn("momentum_buffer", opt.state[param])
+        for param in adam_group["params"]:
+            if param.grad is not None:
+                self.assertIn("exp_avg", opt.state[param])
 
 
 class TestOptimizersInBackwardWithParamGroups(unittest.TestCase):

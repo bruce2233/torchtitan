@@ -218,6 +218,55 @@ def llama3_nanogpt_contrastive_ntp() -> Trainer.Config:
     )
 
 
+def llama3_nanogpt_contrastive_ntp_fp8_muon() -> Trainer.Config:
+    """Contrastive NanoGPT run with FP8 transformer linears and MuonAdamW."""
+    config = llama3_nanogpt_contrastive_ntp()
+    model_compile_enabled = (
+        config.compile.enable and "model" in config.compile.components
+    )
+    config.dump_folder = "./outputs/nanogpt_contrastive_ntp_fp8_muon"
+    config.model_spec = model_registry(
+        "nanogpt_smoke",
+        quantization=[
+            Float8LinearConverter.Config(
+                filter_fqns=["lm_head", "output"],
+                model_compile_enabled=model_compile_enabled,
+            ),
+        ],
+    )
+    config.optimizer = OptimizersContainer.Config(
+        name="MuonAdamW",
+        lr=3e-4,
+        muon_lr=0.02,
+        weight_decay=0.1,
+        muon_momentum=0.95,
+        muon_nesterov=True,
+        muon_ns_steps=5,
+        implementation="fused",
+    )
+    config.lr_scheduler = LRSchedulersContainer.Config(
+        warmup_steps=100,
+        decay_ratio=1.0,
+        decay_type="linear",
+        min_lr_factor=0.1,
+    )
+    config.training = TrainingConfig(
+        local_batch_size=1,
+        global_batch_size=1,
+        seq_len=20000,
+        steps=3000,
+        gc_freq=10,
+    )
+    config.metrics = MetricsProcessor.Config(log_freq=50)
+    config.checkpoint = CheckpointManager.Config(
+        enable=True,
+        interval=3000,
+        keep_latest_k=0,
+        last_save_model_only=False,
+    )
+    return config
+
+
 def llama3_debugmodel_float8_emulate() -> Trainer.Config:
     config = llama3_debugmodel()
     config.model_spec = model_registry(
