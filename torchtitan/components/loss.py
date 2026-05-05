@@ -11,6 +11,7 @@ from typing import TypeAlias
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torchtitan.config import CompileConfig, Configurable
 from torchtitan.tools.logging import logger
 
@@ -35,6 +36,184 @@ def mse_loss(pred: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     return torch.nn.functional.mse_loss(
         pred.float(), labels.float().detach(), reduction="sum"
     )
+
+
+def _unwrap_hidden_states(hidden: torch.Tensor | object) -> torch.Tensor:
+    if hasattr(hidden, "last_hidden_state"):
+        hidden = hidden.last_hidden_state
+    elif isinstance(hidden, tuple):
+        hidden = hidden[0]
+    if not isinstance(hidden, torch.Tensor):
+        raise TypeError(
+            "Transformer must return a Tensor, a tuple whose first item is a Tensor, "
+            "or an object with last_hidden_state."
+        )
+    return hidden
+
+
+def _flatten_valid_contrastive_targets(
+    hidden_states: torch.Tensor,
+    targets: torch.Tensor,
+    *,
+    pad_id: int | None = None,
+    ignore_index: int | None = IGNORE_INDEX,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Flatten hidden/target pairs and drop ignored targets."""
+    if hidden_states.ndim != 3:
+        raise ValueError(
+            f"hidden_states must have shape [B, T, D], got {tuple(hidden_states.shape)}"
+        )
+    if targets.shape != hidden_states.shape[:2]:
+        raise ValueError(
+            f"targets must have shape {tuple(hidden_states.shape[:2])}, "
+            f"got {tuple(targets.shape)}"
+        )
+
+    queries = hidden_states.reshape(-1, hidden_states.shape[-1])
+    targets = targets.reshape(-1)
+
+    valid = torch.ones_like(targets, dtype=torch.bool)
+    if ignore_index is not None:
+        valid = valid & (targets != ignore_index)
+    if pad_id is not None:
+        valid = valid & (targets != pad_id)
+
+    return queries[valid], targets[valid]
+
+
+def _build_batch_local_candidates(
+    targets: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.unique(targets, sorted=False, return_inverse=True)
+
+
+def _empty_contrastive_metrics(reference: torch.Tensor) -> dict[str, torch.Tensor]:
+    zero = (reference.sum() * 0.0).detach()
+    return {
+        "local_acc": zero,
+        "local_acc5": zero,
+        "num_candidates": torch.tensor(
+            0, device=reference.device, dtype=torch.int64
+        ),
+        "num_queries": torch.tensor(0, device=reference.device, dtype=torch.int64),
+    }
+
+
+def _contrastive_ntp_loss_from_hidden(
+    hidden_states: torch.Tensor,
+    targets: torch.Tensor,
+    token_embedding: nn.Module,
+    *,
+    tau: float = 0.07,
+    pad_id: int | None = None,
+    normalize: bool = True,
+    ignore_index: int | None = IGNORE_INDEX,
+    reduction: str = "mean",
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Contrastive NTP over the unique target ids present in this batch."""
+    if tau <= 0:
+        raise ValueError(f"tau must be positive, got {tau}")
+
+    queries, targets = _flatten_valid_contrastive_targets(
+        hidden_states,
+        targets,
+        pad_id=pad_id,
+        ignore_index=ignore_index,
+    )
+
+    if targets.numel() == 0:
+        return hidden_states.sum() * 0.0, _empty_contrastive_metrics(hidden_states)
+
+    unique_ids, candidate_labels = _build_batch_local_candidates(targets)
+    candidate_emb = token_embedding(unique_ids)
+
+    if candidate_emb.shape[-1] != queries.shape[-1]:
+        raise ValueError(
+            f"Candidate embedding dim {candidate_emb.shape[-1]} does not match "
+            f"hidden dim {queries.shape[-1]}"
+        )
+
+    if normalize:
+        queries = F.normalize(queries, dim=-1)
+        candidate_emb = F.normalize(candidate_emb, dim=-1)
+
+    logits = queries @ candidate_emb.T
+    logits = logits / tau
+    loss = F.cross_entropy(logits.float(), candidate_labels, reduction=reduction)
+
+    with torch.no_grad():
+        pred = logits.argmax(dim=-1)
+        local_acc = (pred == candidate_labels).float().mean()
+
+        k = min(5, logits.size(-1))
+        topk = logits.topk(k=k, dim=-1).indices
+        local_acc5 = (topk == candidate_labels[:, None]).any(dim=-1).float().mean()
+
+    metrics = {
+        "local_acc": local_acc.detach(),
+        "local_acc5": local_acc5.detach(),
+        "num_candidates": torch.tensor(
+            unique_ids.numel(), device=hidden_states.device, dtype=torch.int64
+        ),
+        "num_queries": torch.tensor(
+            targets.numel(), device=hidden_states.device, dtype=torch.int64
+        ),
+    }
+    return loss, metrics
+
+
+def contrastive_ntp_loss(
+    input_ids: torch.Tensor,
+    transformer: nn.Module,
+    token_embedding: nn.Module,
+    tau: float = 0.07,
+    pad_id: int | None = None,
+    normalize: bool = True,
+    return_metrics: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Batch-local unique-token contrastive next-token prediction.
+
+    This standalone helper follows the original experiment definition:
+    one causal forward over ``input_ids``, then ``hidden[:, :-1]`` predicts
+    ``input_ids[:, 1:]`` inside the batch-local unique target-token set.
+    """
+    hidden_states = _unwrap_hidden_states(transformer(input_ids))
+    queries = hidden_states[:, :-1, :]
+    targets = input_ids[:, 1:]
+    loss, metrics = _contrastive_ntp_loss_from_hidden(
+        queries,
+        targets,
+        token_embedding,
+        tau=tau,
+        pad_id=pad_id,
+        normalize=normalize,
+        ignore_index=None,
+        reduction="mean",
+    )
+    if return_metrics:
+        return loss, metrics
+    return loss
+
+
+def contrastive_ntp_loss_with_metrics(
+    input_ids: torch.Tensor,
+    transformer: nn.Module,
+    token_embedding: nn.Module,
+    tau: float = 0.07,
+    pad_id: int | None = None,
+    normalize: bool = True,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Standalone contrastive NTP helper that always returns debug metrics."""
+    loss, metrics = contrastive_ntp_loss(
+        input_ids=input_ids,
+        transformer=transformer,
+        token_embedding=token_embedding,
+        tau=tau,
+        pad_id=pad_id,
+        normalize=normalize,
+        return_metrics=True,
+    )
+    return loss, metrics
 
 
 class BaseLoss(ABC, Configurable):
@@ -98,6 +277,79 @@ class MSELoss(BaseLoss):
     def __init__(self, config: Config, *, compile_config: CompileConfig | None = None):
         self.fn: LossFunction = mse_loss
         self._maybe_compile(compile_config)
+
+
+class ContrastiveNTPLoss(BaseLoss):
+    """Batch-local unique-token contrastive next-token prediction loss.
+
+    TorchTitan text dataloaders already return shifted ``labels``. This loss
+    therefore expects ``pred`` to be decoder hidden states [B, T, D] produced
+    with the model's ``lm_head`` skipped, and uses ``labels`` [B, T] as the
+    next-token targets.
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(BaseLoss.Config):
+        tau: float = 0.07
+        """Temperature for local contrastive logits."""
+
+        normalize: bool = True
+        """Whether to use cosine similarity between hidden states and embeddings."""
+
+        pad_id: int | None = None
+        """Optional pad token id to exclude from the target candidate set."""
+
+    def __init__(
+        self,
+        config: Config,
+        *,
+        compile_config: CompileConfig | None = None,
+    ):
+        self.fn = _contrastive_ntp_loss_from_hidden
+        if (
+            compile_config is not None
+            and compile_config.enable
+            and "loss" in compile_config.components
+        ):
+            logger.warning(
+                "ContrastiveNTPLoss is not compiled because its batch-local "
+                "candidate set is dynamically built with torch.unique."
+            )
+        self.tau = config.tau
+        self.normalize = config.normalize
+        self.pad_id = config.pad_id
+        self.token_embedding: nn.Module | None = None
+        self.last_metrics: dict[str, torch.Tensor] = {}
+
+    def set_token_embedding(self, token_embedding: nn.Module) -> None:
+        """Set the token embedding module used as the candidate encoder."""
+        self.token_embedding = token_embedding
+
+    def __call__(
+        self,
+        pred: torch.Tensor,
+        labels: torch.Tensor,
+        global_valid_tokens: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        token_embedding = self.token_embedding
+        assert token_embedding is not None, (
+            "Set token_embedding before calling ContrastiveNTPLoss"
+        )
+        loss, metrics = self.fn(
+            pred,
+            labels,
+            token_embedding,
+            tau=self.tau,
+            pad_id=self.pad_id,
+            normalize=self.normalize,
+            ignore_index=IGNORE_INDEX,
+            reduction="sum",
+        )
+        self.last_metrics = metrics
+        if global_valid_tokens is not None:
+            if global_valid_tokens.item() > 0:
+                loss = loss / global_valid_tokens
+        return loss
 
 
 class GradAccumulator:

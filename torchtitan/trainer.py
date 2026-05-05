@@ -20,7 +20,12 @@ from torch.distributed.elastic.multiprocessing.errors import record
 
 from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.components.dataloader import BaseDataLoader, DataloaderExhaustedError
-from torchtitan.components.loss import BaseLoss, ChunkedCELoss, IGNORE_INDEX
+from torchtitan.components.loss import (
+    BaseLoss,
+    ChunkedCELoss,
+    ContrastiveNTPLoss,
+    IGNORE_INDEX,
+)
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import ensure_pp_loss_visible, MetricsProcessor
 from torchtitan.components.optimizer import (
@@ -298,6 +303,22 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         self.loss_fn = config.loss.build(
             compile_config=config.compile,
         )
+        if isinstance(self.loss_fn, ContrastiveNTPLoss):
+            if parallel_dims.world_size != 1:
+                raise NotImplementedError(
+                    "ContrastiveNTPLoss currently supports only single-card "
+                    f"training, got world_size={parallel_dims.world_size}."
+                )
+            if (
+                parallel_dims.dp_enabled
+                or parallel_dims.tp_enabled
+                or parallel_dims.pp_enabled
+                or parallel_dims.cp_enabled
+            ):
+                raise NotImplementedError(
+                    "ContrastiveNTPLoss currently supports only non-parallel "
+                    "single-card training."
+                )
 
         # verify batch sizes
         global_batch_size = config.training.global_batch_size
@@ -412,6 +433,27 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 self.model_parts[
                     0
                 ]._skip_lm_head = True  # pyrefly: ignore[bad-argument-type]
+
+        if isinstance(self.loss_fn, ContrastiveNTPLoss):
+            assert len(self.model_parts) == 1
+            token_embedding = self.model_parts[0].tok_embeddings
+            assert (
+                token_embedding is not None
+            ), "Model must have tok_embeddings for ContrastiveNTPLoss"
+            lm_head = self.model_parts[0].lm_head
+            if (
+                lm_head is not None
+                and getattr(lm_head, "weight", None)
+                is not getattr(token_embedding, "weight", None)
+            ):
+                for param in lm_head.parameters():
+                    param.requires_grad_(False)
+            self.loss_fn.set_token_embedding(
+                token_embedding  # pyrefly: ignore[bad-argument-type]
+            )
+            self.model_parts[
+                0
+            ]._skip_lm_head = True  # pyrefly: ignore[bad-argument-type]
 
         # initialize device memory monitor and get peak flops for MFU calculation
         device_memory_monitor = self.metrics_processor.device_memory_monitor
@@ -699,6 +741,63 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         # The returned loss here is local SUM loss / global_valid_tokens
         return loss
 
+    def _aggregate_contrastive_metrics(
+        self,
+        metrics_list: list[dict[str, torch.Tensor]],
+    ) -> dict[str, float]:
+        if not metrics_list:
+            return {}
+
+        num_queries = torch.stack(
+            [m["num_queries"].to(self.device).float() for m in metrics_list]
+        )
+        total_queries = num_queries.sum()
+        if total_queries.item() == 0:
+            return {
+                "contrastive/local_acc": 0.0,
+                "contrastive/local_acc5": 0.0,
+                "contrastive/num_candidates": 0.0,
+                "contrastive/num_queries": 0.0,
+                "contrastive/random_top1_baseline": 0.0,
+            }
+
+        weighted_acc = torch.stack(
+            [
+                m["local_acc"].to(self.device).float() * m["num_queries"].to(
+                    self.device
+                ).float()
+                for m in metrics_list
+            ]
+        ).sum()
+        weighted_acc5 = torch.stack(
+            [
+                m["local_acc5"].to(self.device).float() * m["num_queries"].to(
+                    self.device
+                ).float()
+                for m in metrics_list
+            ]
+        ).sum()
+        num_candidates = torch.stack(
+            [m["num_candidates"].to(self.device).float() for m in metrics_list]
+        )
+        nonzero_candidates = num_candidates[num_candidates > 0]
+        avg_candidates = (
+            nonzero_candidates.mean()
+            if nonzero_candidates.numel() > 0
+            else num_candidates.new_zeros(())
+        )
+        random_top1_baseline = (
+            1.0 / avg_candidates.item() if avg_candidates.item() > 0 else 0.0
+        )
+
+        return {
+            "contrastive/local_acc": float((weighted_acc / total_queries).item()),
+            "contrastive/local_acc5": float((weighted_acc5 / total_queries).item()),
+            "contrastive/num_candidates": float(avg_candidates.item()),
+            "contrastive/num_queries": float(total_queries.item()),
+            "contrastive/random_top1_baseline": random_top1_baseline,
+        }
+
     def train_step(
         self, data_iterator: Iterator[tuple[dict[str, torch.Tensor], torch.Tensor]]
     ):
@@ -715,7 +814,13 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         local_valid_tokens = torch.tensor(0, dtype=torch.int64)
         for _microbatch in range(self.gradient_accumulation_steps):
             input_dict, labels = next(data_iterator)
-            local_valid_tokens += (labels != IGNORE_INDEX).sum()
+            valid_labels = labels != IGNORE_INDEX
+            if (
+                isinstance(self.loss_fn, ContrastiveNTPLoss)
+                and self.loss_fn.pad_id is not None
+            ):
+                valid_labels = valid_labels & (labels != self.loss_fn.pad_id)
+            local_valid_tokens += valid_labels.sum()
             microbatches.append((input_dict, labels))
 
         # All-reduce to get global token count across DP ranks
@@ -729,6 +834,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
 
         # Process each microbatch: move to GPU, forward/backward, then free
         accumulated_losses = []
+        contrastive_metrics: list[dict[str, torch.Tensor]] = []
         for input_dict, labels in microbatches:
             # Move tensors to GPU
             for k, v in input_dict.items():
@@ -743,6 +849,13 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 global_valid_tokens=global_valid_tokens,
             )
             accumulated_losses.append(loss.detach())
+            if isinstance(self.loss_fn, ContrastiveNTPLoss):
+                contrastive_metrics.append(
+                    {
+                        k: v.detach()
+                        for k, v in self.loss_fn.last_metrics.items()
+                    }
+                )
 
         grad_norm = dist_utils.clip_grad_norm_(
             [p for m in self.model_parts for p in m.parameters()],
@@ -794,6 +907,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             "n_tokens_seen": global_ntokens_seen,
             "lr": lr,
         }
+        extra_metrics.update(self._aggregate_contrastive_metrics(contrastive_metrics))
         self.metrics_processor.log(
             self.step,
             global_avg_loss,

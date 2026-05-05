@@ -523,6 +523,15 @@ class MetricsProcessor(Configurable):
 
         color = self.color
         mfu_str = f"{mfu:.2f}%" if mfu is not None else "N/A"
+        contrastive_str = ""
+        if "contrastive/local_acc" in metrics:
+            contrastive_str = (
+                f"  {color.yellow}local_acc: "
+                f"{metrics['contrastive/local_acc']:.4f}  "
+                f"local_acc5: {metrics['contrastive/local_acc5']:.4f}  "
+                f"candidates: {metrics['contrastive/num_candidates']:.1f}  "
+                f"queries: {metrics['contrastive/num_queries']:.0f}"
+            )
         logger.info(
             f"{color.red}step: {step:2}  "
             f"{color.green}loss: {global_avg_loss:8.5f}  "
@@ -531,7 +540,8 @@ class MetricsProcessor(Configurable):
             f"({device_mem_stats.max_reserved_pct:.2f}%)  "
             f"{color.blue}tps: {round(tps):,}  "
             f"{color.cyan}tflops: {tflops:,.2f}  "
-            f"{color.magenta}mfu: {mfu_str}{color.reset}"
+            f"{color.magenta}mfu: {mfu_str}"
+            f"{contrastive_str}{color.reset}"
         )
 
         self.ntokens_since_last_log = 0
