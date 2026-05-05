@@ -15,6 +15,7 @@ import argparse
 import json
 import sys
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -99,6 +100,12 @@ def _load_checkpoint(model: torch.nn.Module, checkpoint: str) -> None:
         f"Loaded checkpoint in {time.monotonic() - begin:.2f}s",
         file=sys.stderr,
     )
+
+
+def _autocast_context(device: torch.device, dtype: torch.dtype):
+    if device.type == "cuda" and dtype in (torch.bfloat16, torch.float16):
+        return torch.autocast(device_type=device.type, dtype=dtype)
+    return nullcontext()
 
 
 @torch.no_grad()
@@ -279,8 +286,6 @@ def main() -> None:
         print("WARNING: running with randomly initialized weights", file=sys.stderr)
 
     dtype = _dtype_from_name(args.dtype)
-    if dtype != torch.float32:
-        model.to(dtype=dtype)
 
     valid_vocab_size = (
         model.tok_embeddings.weight.shape[0]  # pyrefly: ignore[missing-attribute]
@@ -290,32 +295,34 @@ def main() -> None:
     normalize = not args.no_normalize
 
     rank_context = input_ids[:, -args.max_context_tokens :]
-    logits = _next_token_logits(
-        model,
-        rank_context,
-        tau=args.tau,
-        normalize=normalize,
-        valid_vocab_size=valid_vocab_size,
-    )
-    top_candidates = _topk_report(tokenizer, logits, top_k=args.top_k)
+    with _autocast_context(device, dtype):
+        logits = _next_token_logits(
+            model,
+            rank_context,
+            tau=args.tau,
+            normalize=normalize,
+            valid_vocab_size=valid_vocab_size,
+        )
+        top_candidates = _topk_report(tokenizer, logits, top_k=args.top_k)
 
     generated_text = None
     generated_token_ids = None
     if args.max_new_tokens > 0:
-        generated = _generate(
-            model,
-            input_ids,
-            tokenizer=tokenizer,
-            max_new_tokens=args.max_new_tokens,
-            max_context_tokens=args.max_context_tokens,
-            tau=args.tau,
-            normalize=normalize,
-            temperature=args.temperature,
-            top_k=args.top_k,
-            sample=args.sample,
-            seed=args.seed,
-            valid_vocab_size=valid_vocab_size,
-        )
+        with _autocast_context(device, dtype):
+            generated = _generate(
+                model,
+                input_ids,
+                tokenizer=tokenizer,
+                max_new_tokens=args.max_new_tokens,
+                max_context_tokens=args.max_context_tokens,
+                tau=args.tau,
+                normalize=normalize,
+                temperature=args.temperature,
+                top_k=args.top_k,
+                sample=args.sample,
+                seed=args.seed,
+                valid_vocab_size=valid_vocab_size,
+            )
         generated_token_ids = generated[0].tolist()
         generated_text = tokenizer.decode(
             [t for t in generated_token_ids if 0 <= t < tokenizer.n_vocab]
