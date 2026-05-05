@@ -5,11 +5,19 @@
 # LICENSE file in the root directory of this source tree.
 
 import unittest
+from array import array
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
+import torch
 from torch.utils.data import IterableDataset
 
 from torchtitan.components.dataloader import ParallelAwareDataloader
 from torchtitan.components.tokenizer import BaseTokenizer
+from torchtitan.hf_datasets.nanogpt_datasets import (
+    load_nanogpt_bin_tokens,
+    NanoGPTTokenDataLoader,
+)
 from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
 
 
@@ -46,6 +54,14 @@ class DummyTokenizer(BaseTokenizer):
 
     def get_vocab_size(self) -> int:
         return 256  # ASCII range
+
+
+def write_nanogpt_bin(path: Path, tokens: list[int]) -> None:
+    header = array("i", [20240520, 1, len(tokens), *([0] * 253)])
+    payload = array("H", tokens)
+    with path.open("wb") as f:
+        header.tofile(f)
+        payload.tofile(f)
 
 
 class TestParallelAwareDataloader(unittest.TestCase):
@@ -178,6 +194,82 @@ class TestParallelAwareDataloader(unittest.TestCase):
                     if tok == tokenizer.bos_id and i > 0:
                         # BOS token should have position 0
                         self.assertEqual(pos.item(), 0)
+
+    def test_nanogpt_bin_loader_reads_contiguous_batches(self):
+        tokenizer = DummyTokenizer()
+        with TemporaryDirectory() as tmp:
+            data_file = Path(tmp) / "fineweb_train_000001.bin"
+            write_nanogpt_bin(data_file, [50256, *range(1, 32)])
+
+            loaded = load_nanogpt_bin_tokens(data_file)
+            self.assertEqual(loaded.dtype, torch.uint16)
+            self.assertEqual(loaded[:5].tolist(), [50256, 1, 2, 3, 4])
+
+            dataloader = NanoGPTTokenDataLoader(
+                NanoGPTTokenDataLoader.Config(
+                    dataset_path=str(Path(tmp) / "*.bin"),
+                    align_to_bos=False,
+                    infinite=False,
+                ),
+                dp_world_size=1,
+                dp_rank=0,
+                tokenizer=tokenizer,
+                seq_len=4,
+                local_batch_size=2,
+            )
+
+            input_dict, labels = next(iter(dataloader))
+            self.assertEqual(
+                input_dict["input"].tolist(),
+                [[50256, 1, 2, 3], [4, 5, 6, 7]],
+            )
+            self.assertEqual(labels.tolist(), [[1, 2, 3, 4], [5, 6, 7, 8]])
+            self.assertEqual(input_dict["positions"].tolist(), [[0, 1, 2, 3]] * 2)
+
+    def test_nanogpt_bin_loader_aligns_to_bos(self):
+        tokenizer = DummyTokenizer()
+        with TemporaryDirectory() as tmp:
+            data_file = Path(tmp) / "fineweb_train_000001.bin"
+            write_nanogpt_bin(
+                data_file,
+                [
+                    50256,
+                    10,
+                    11,
+                    12,
+                    13,
+                    50256,
+                    20,
+                    21,
+                    22,
+                    23,
+                    50256,
+                    30,
+                    31,
+                    32,
+                    33,
+                ],
+            )
+
+            dataloader = NanoGPTTokenDataLoader(
+                NanoGPTTokenDataLoader.Config(
+                    dataset_path=str(data_file),
+                    align_to_bos=True,
+                    infinite=False,
+                ),
+                dp_world_size=1,
+                dp_rank=0,
+                tokenizer=tokenizer,
+                seq_len=4,
+                local_batch_size=2,
+            )
+
+            input_dict, labels = next(iter(dataloader))
+            self.assertEqual(
+                input_dict["input"].tolist(),
+                [[50256, 10, 11, 12], [50256, 20, 21, 22]],
+            )
+            self.assertEqual(labels.tolist(), [[10, 11, 12, 13], [20, 21, 22, 23]])
 
 
 if __name__ == "__main__":

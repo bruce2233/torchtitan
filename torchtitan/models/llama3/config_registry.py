@@ -5,7 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 from torchtitan.components.checkpoint import CheckpointManager
-from torchtitan.components.loss import ChunkedCELoss
+from torchtitan.components.loss import ChunkedCELoss, CrossEntropyLoss
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.optimizer import (
@@ -20,6 +20,7 @@ from torchtitan.config import (
     ParallelismConfig,
     TrainingConfig,
 )
+from torchtitan.hf_datasets.nanogpt_datasets import NanoGPTTokenDataLoader
 from torchtitan.hf_datasets.text_datasets import (
     ChatDataLoader,
     HuggingFaceTextDataLoader,
@@ -106,11 +107,46 @@ def llama3_debugmodel_float8() -> Trainer.Config:
 
 def llama3_debugmodel_ce_loss() -> Trainer.Config:
     """Debug model with standard (non-chunked) CrossEntropyLoss."""
-    from torchtitan.components.loss import CrossEntropyLoss
-
     config = llama3_debugmodel()
     config.loss = CrossEntropyLoss.Config()
     return config
+
+
+def llama3_nanogpt_smoke() -> Trainer.Config:
+    """Minimal pre-training smoke test on modded-nanogpt FineWeb token shards."""
+    return Trainer.Config(
+        loss=CrossEntropyLoss.Config(),
+        hf_assets_path="./tests/assets/tokenizer",
+        dump_folder="./outputs/nanogpt_smoke",
+        model_spec=model_registry("nanogpt_smoke"),
+        dataloader=NanoGPTTokenDataLoader.Config(
+            dataset_path="../modded-nanogpt/data/fineweb10B/fineweb_train_*.bin",
+            align_to_bos=True,
+            infinite=True,
+        ),
+        optimizer=OptimizersContainer.Config(
+            lr=3e-4,
+            weight_decay=0.1,
+        ),
+        lr_scheduler=LRSchedulersContainer.Config(
+            warmup_steps=1,
+            decay_ratio=1.0,
+            decay_type="linear",
+            min_lr_factor=0.1,
+        ),
+        training=TrainingConfig(
+            local_batch_size=1,
+            global_batch_size=1,
+            seq_len=128,
+            steps=3,
+            gc_freq=10,
+        ),
+        metrics=MetricsProcessor.Config(log_freq=1),
+        checkpoint=CheckpointManager.Config(enable=False),
+        activation_checkpoint=ActivationCheckpointConfig(mode="none"),
+        parallelism=ParallelismConfig(),
+        validator=Validator.Config(enable=False),
+    )
 
 
 def llama3_debugmodel_float8_emulate() -> Trainer.Config:
