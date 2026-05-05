@@ -90,6 +90,8 @@ def _build_batch_local_candidates(
 def _empty_contrastive_metrics(reference: torch.Tensor) -> dict[str, torch.Tensor]:
     zero = (reference.sum() * 0.0).detach()
     return {
+        "loss_c2t": zero,
+        "loss_t2c": zero,
         "local_acc": zero,
         "local_acc5": zero,
         "num_candidates": torch.tensor(
@@ -97,6 +99,21 @@ def _empty_contrastive_metrics(reference: torch.Tensor) -> dict[str, torch.Tenso
         ),
         "num_queries": torch.tensor(0, device=reference.device, dtype=torch.int64),
     }
+
+
+def _token_to_context_loss(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+) -> torch.Tensor:
+    """Multi-positive InfoNCE over contexts for each unique target token."""
+    log_probs_t2c = F.log_softmax(logits.float().T, dim=-1)
+    token_indices = torch.arange(logits.shape[-1], device=labels.device)
+    positive_mask = labels[None, :] == token_indices[:, None]
+    pos_log_prob = torch.logsumexp(
+        log_probs_t2c.masked_fill(~positive_mask, float("-inf")),
+        dim=-1,
+    )
+    return -pos_log_prob.mean()
 
 
 def _contrastive_ntp_loss_from_hidden(
@@ -107,12 +124,17 @@ def _contrastive_ntp_loss_from_hidden(
     tau: float = 0.07,
     pad_id: int | None = None,
     normalize: bool = True,
+    lambda_t2c: float = 1.0,
     ignore_index: int | None = IGNORE_INDEX,
     reduction: str = "mean",
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Contrastive NTP over the unique target ids present in this batch."""
     if tau <= 0:
         raise ValueError(f"tau must be positive, got {tau}")
+    if lambda_t2c < 0:
+        raise ValueError(f"lambda_t2c must be non-negative, got {lambda_t2c}")
+    if reduction not in {"mean", "sum"}:
+        raise ValueError(f"Unsupported reduction for ContrastiveNTPLoss: {reduction}")
 
     queries, targets = _flatten_valid_contrastive_targets(
         hidden_states,
@@ -139,7 +161,22 @@ def _contrastive_ntp_loss_from_hidden(
 
     logits = queries @ candidate_emb.T
     logits = logits / tau
-    loss = F.cross_entropy(logits.float(), candidate_labels, reduction=reduction)
+    loss_c2t_sum = F.cross_entropy(
+        logits.float(),
+        candidate_labels,
+        reduction="sum",
+    )
+    num_queries = targets.numel()
+    loss_c2t = loss_c2t_sum / num_queries
+    loss_t2c = _token_to_context_loss(logits, candidate_labels)
+
+    if reduction == "sum":
+        # Trainer divides by global valid tokens later. Scale the unique-token
+        # averaged t2c term by the local query count so the effective objective
+        # is mean(c2t) + lambda_t2c * mean(t2c).
+        loss = loss_c2t_sum + lambda_t2c * loss_t2c * num_queries
+    else:
+        loss = loss_c2t + lambda_t2c * loss_t2c
 
     with torch.no_grad():
         pred = logits.argmax(dim=-1)
@@ -150,6 +187,8 @@ def _contrastive_ntp_loss_from_hidden(
         local_acc5 = (topk == candidate_labels[:, None]).any(dim=-1).float().mean()
 
     metrics = {
+        "loss_c2t": loss_c2t.detach(),
+        "loss_t2c": loss_t2c.detach(),
         "local_acc": local_acc.detach(),
         "local_acc5": local_acc5.detach(),
         "num_candidates": torch.tensor(
@@ -169,13 +208,15 @@ def contrastive_ntp_loss(
     tau: float = 0.07,
     pad_id: int | None = None,
     normalize: bool = True,
+    lambda_t2c: float = 1.0,
     return_metrics: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    """Batch-local unique-token contrastive next-token prediction.
+    """Symmetric batch-local unique-token contrastive next-token prediction.
 
     This standalone helper follows the original experiment definition:
     one causal forward over ``input_ids``, then ``hidden[:, :-1]`` predicts
-    ``input_ids[:, 1:]`` inside the batch-local unique target-token set.
+    ``input_ids[:, 1:]`` inside the batch-local unique target-token set. It
+    computes context->token CE plus multi-positive token->context InfoNCE.
     """
     hidden_states = _unwrap_hidden_states(transformer(input_ids))
     queries = hidden_states[:, :-1, :]
@@ -187,6 +228,7 @@ def contrastive_ntp_loss(
         tau=tau,
         pad_id=pad_id,
         normalize=normalize,
+        lambda_t2c=lambda_t2c,
         ignore_index=None,
         reduction="mean",
     )
@@ -202,6 +244,7 @@ def contrastive_ntp_loss_with_metrics(
     tau: float = 0.07,
     pad_id: int | None = None,
     normalize: bool = True,
+    lambda_t2c: float = 1.0,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Standalone contrastive NTP helper that always returns debug metrics."""
     loss, metrics = contrastive_ntp_loss(
@@ -211,6 +254,7 @@ def contrastive_ntp_loss_with_metrics(
         tau=tau,
         pad_id=pad_id,
         normalize=normalize,
+        lambda_t2c=lambda_t2c,
         return_metrics=True,
     )
     return loss, metrics
@@ -280,12 +324,13 @@ class MSELoss(BaseLoss):
 
 
 class ContrastiveNTPLoss(BaseLoss):
-    """Batch-local unique-token contrastive next-token prediction loss.
+    """Symmetric batch-local unique-token contrastive next-token prediction.
 
     TorchTitan text dataloaders already return shifted ``labels``. This loss
     therefore expects ``pred`` to be decoder hidden states [B, T, D] produced
     with the model's ``lm_head`` skipped, and uses ``labels`` [B, T] as the
-    next-token targets.
+    next-token targets. The objective is context->token CE plus weighted
+    multi-positive token->context InfoNCE.
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -298,6 +343,9 @@ class ContrastiveNTPLoss(BaseLoss):
 
         pad_id: int | None = None
         """Optional pad token id to exclude from the target candidate set."""
+
+        lambda_t2c: float = 1.0
+        """Weight for the token-to-context multi-positive InfoNCE direction."""
 
     def __init__(
         self,
@@ -318,6 +366,7 @@ class ContrastiveNTPLoss(BaseLoss):
         self.tau = config.tau
         self.normalize = config.normalize
         self.pad_id = config.pad_id
+        self.lambda_t2c = config.lambda_t2c
         self.token_embedding: nn.Module | None = None
         self.last_metrics: dict[str, torch.Tensor] = {}
 
@@ -342,6 +391,7 @@ class ContrastiveNTPLoss(BaseLoss):
             tau=self.tau,
             pad_id=self.pad_id,
             normalize=self.normalize,
+            lambda_t2c=self.lambda_t2c,
             ignore_index=IGNORE_INDEX,
             reduction="sum",
         )

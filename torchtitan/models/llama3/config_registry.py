@@ -119,7 +119,11 @@ def llama3_debugmodel_ce_loss() -> Trainer.Config:
 def llama3_debugmodel_contrastive_ntp() -> Trainer.Config:
     """Debug model using batch-local contrastive next-token prediction."""
     config = llama3_debugmodel()
-    config.loss = ContrastiveNTPLoss.Config(tau=0.07, normalize=True)
+    config.loss = ContrastiveNTPLoss.Config(
+        tau=0.07,
+        normalize=True,
+        lambda_t2c=1.0,
+    )
     config.optimizer = OptimizersContainer.Config(lr=3e-4)
     config.training = TrainingConfig(
         local_batch_size=4,
@@ -176,7 +180,11 @@ def llama3_nanogpt_smoke() -> Trainer.Config:
 def llama3_nanogpt_contrastive_ntp() -> Trainer.Config:
     """Batch-local contrastive NTP on modded-nanogpt FineWeb token shards."""
     return Trainer.Config(
-        loss=ContrastiveNTPLoss.Config(tau=0.07, normalize=True),
+        loss=ContrastiveNTPLoss.Config(
+            tau=0.07,
+            normalize=True,
+            lambda_t2c=1.0,
+        ),
         hf_assets_path="./tests/assets/tokenizer",
         dump_folder="./outputs/nanogpt_contrastive_ntp",
         model_spec=model_registry("nanogpt_smoke"),

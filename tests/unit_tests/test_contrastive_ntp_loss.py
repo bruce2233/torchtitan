@@ -8,10 +8,12 @@ import unittest
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from torchtitan.components.loss import (
     _build_batch_local_candidates,
     _flatten_valid_contrastive_targets,
+    _token_to_context_loss,
     contrastive_ntp_loss_with_metrics,
 )
 
@@ -108,6 +110,67 @@ class TestContrastiveNTPLoss(unittest.TestCase):
             "transformer parameters should receive gradients",
         )
         self.assertIsNotNone(token_embedding.weight.grad)
+
+    def test_token_to_context_loss_is_multi_positive(self):
+        logits = torch.tensor(
+            [
+                [3.0, 0.0],
+                [0.0, 3.0],
+                [2.0, 0.0],
+            ]
+        )
+        labels = torch.tensor([0, 1, 0], dtype=torch.long)
+
+        actual = _token_to_context_loss(logits, labels)
+
+        log_probs = F.log_softmax(logits.T, dim=-1)
+        expected_for_token_0 = torch.logsumexp(
+            torch.stack([log_probs[0, 0], log_probs[0, 2]]),
+            dim=0,
+        )
+        expected_for_token_1 = log_probs[1, 1]
+        expected = -torch.stack(
+            [expected_for_token_0, expected_for_token_1]
+        ).mean()
+
+        self.assertTrue(torch.allclose(actual, expected))
+
+    def test_symmetric_loss_combines_c2t_and_t2c(self):
+        torch.manual_seed(456)
+        vocab_size = 16
+        dim = 8
+        transformer = _TinyTransformer(vocab_size, dim)
+        token_embedding = nn.Embedding(vocab_size, dim)
+        input_ids = torch.tensor([[1, 2, 3, 2, 4]], dtype=torch.long)
+
+        loss, metrics = contrastive_ntp_loss_with_metrics(
+            input_ids=input_ids,
+            transformer=transformer,
+            token_embedding=token_embedding,
+            tau=0.07,
+            normalize=True,
+            lambda_t2c=1.0,
+        )
+        expected = metrics["loss_c2t"] + metrics["loss_t2c"]
+
+        self.assertGreater(metrics["loss_t2c"].item(), 0.0)
+        self.assertTrue(torch.allclose(loss.detach(), expected, atol=1e-6))
+
+        c2t_only_loss, c2t_only_metrics = contrastive_ntp_loss_with_metrics(
+            input_ids=input_ids,
+            transformer=transformer,
+            token_embedding=token_embedding,
+            tau=0.07,
+            normalize=True,
+            lambda_t2c=0.0,
+        )
+        self.assertTrue(
+            torch.allclose(
+                c2t_only_loss.detach(),
+                c2t_only_metrics["loss_c2t"],
+                atol=1e-6,
+            )
+        )
 
 
 if __name__ == "__main__":

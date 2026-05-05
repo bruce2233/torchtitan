@@ -526,7 +526,10 @@ class MetricsProcessor(Configurable):
         contrastive_str = ""
         if "contrastive/local_acc" in metrics:
             contrastive_str = (
-                f"  {color.yellow}local_acc: "
+                f"  {color.yellow}c2t: "
+                f"{metrics['contrastive/loss_c2t']:.4f}  "
+                f"t2c: {metrics['contrastive/loss_t2c']:.4f}  "
+                f"local_acc: "
                 f"{metrics['contrastive/local_acc']:.4f}  "
                 f"local_acc5: {metrics['contrastive/local_acc5']:.4f}  "
                 f"candidates: {metrics['contrastive/num_candidates']:.1f}  "

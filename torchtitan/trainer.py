@@ -754,6 +754,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         total_queries = num_queries.sum()
         if total_queries.item() == 0:
             return {
+                "contrastive/loss_c2t": 0.0,
+                "contrastive/loss_t2c": 0.0,
                 "contrastive/local_acc": 0.0,
                 "contrastive/local_acc5": 0.0,
                 "contrastive/num_candidates": 0.0,
@@ -761,6 +763,22 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 "contrastive/random_top1_baseline": 0.0,
             }
 
+        weighted_loss_c2t = torch.stack(
+            [
+                m["loss_c2t"].to(self.device).float() * m["num_queries"].to(
+                    self.device
+                ).float()
+                for m in metrics_list
+            ]
+        ).sum()
+        weighted_loss_t2c = torch.stack(
+            [
+                m["loss_t2c"].to(self.device).float() * m["num_queries"].to(
+                    self.device
+                ).float()
+                for m in metrics_list
+            ]
+        ).sum()
         weighted_acc = torch.stack(
             [
                 m["local_acc"].to(self.device).float() * m["num_queries"].to(
@@ -791,6 +809,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         )
 
         return {
+            "contrastive/loss_c2t": float((weighted_loss_c2t / total_queries).item()),
+            "contrastive/loss_t2c": float((weighted_loss_t2c / total_queries).item()),
             "contrastive/local_acc": float((weighted_acc / total_queries).item()),
             "contrastive/local_acc5": float((weighted_acc5 / total_queries).item()),
             "contrastive/num_candidates": float(avg_candidates.item()),
