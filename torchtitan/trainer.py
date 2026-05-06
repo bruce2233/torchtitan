@@ -304,20 +304,15 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             compile_config=config.compile,
         )
         if isinstance(self.loss_fn, ContrastiveNTPLoss):
-            if parallel_dims.world_size != 1:
-                raise NotImplementedError(
-                    "ContrastiveNTPLoss currently supports only single-card "
-                    f"training, got world_size={parallel_dims.world_size}."
-                )
             if (
-                parallel_dims.dp_enabled
-                or parallel_dims.tp_enabled
+                parallel_dims.tp_enabled
                 or parallel_dims.pp_enabled
                 or parallel_dims.cp_enabled
+                or parallel_dims.ep > 1
             ):
                 raise NotImplementedError(
-                    "ContrastiveNTPLoss currently supports only non-parallel "
-                    "single-card training."
+                    "ContrastiveNTPLoss currently supports only single-card "
+                    "or pure data-parallel training."
                 )
 
         # verify batch sizes

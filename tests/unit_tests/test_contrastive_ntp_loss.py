@@ -11,6 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from torchtitan.components.loss import (
+    ContrastiveNTPLoss,
     _build_batch_local_candidates,
     _flatten_valid_contrastive_targets,
     _token_to_context_loss,
@@ -171,6 +172,25 @@ class TestContrastiveNTPLoss(unittest.TestCase):
                 atol=1e-6,
             )
         )
+
+    def test_loss_accepts_float_global_valid_tokens(self):
+        torch.manual_seed(789)
+        vocab_size = 16
+        dim = 8
+        token_embedding = nn.Embedding(vocab_size, dim)
+        hidden = torch.randn(1, 4, dim, requires_grad=True)
+        labels = torch.tensor([[2, 3, 2, 4]], dtype=torch.long)
+        loss_fn = ContrastiveNTPLoss(
+            ContrastiveNTPLoss.Config(tau=0.07, normalize=True)
+        )
+        loss_fn.set_token_embedding(token_embedding)
+
+        loss = loss_fn(hidden, labels, global_valid_tokens=4.0)
+        loss.backward()
+
+        self.assertTrue(torch.isfinite(loss))
+        self.assertIsNotNone(hidden.grad)
+        self.assertIsNotNone(token_embedding.weight.grad)
 
 
 if __name__ == "__main__":

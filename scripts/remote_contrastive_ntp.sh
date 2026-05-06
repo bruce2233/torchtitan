@@ -2,8 +2,9 @@
 set -euo pipefail
 
 HOME_DIR="${HOME:?HOME is not set}"
-REPO_DIR="${REPO_DIR:-${HOME_DIR}/torchtitan}"
-TMP_ROOT="${TMP_ROOT:-${HOME_DIR}/torchtitan_tmp}"
+APP_ROOT="${APP_ROOT:-${HOME_DIR}/app}"
+REPO_DIR="${REPO_DIR:-${APP_ROOT}/torchtitan}"
+TMP_ROOT="${TMP_ROOT:-${APP_ROOT}/torchtitan_tmp}"
 VENV_DIR="${VENV_DIR:-${REPO_DIR}/.venv}"
 DATA_DIR="${DATA_DIR:-${TMP_ROOT}/modded-nanogpt/data/fineweb10B}"
 DUMP_ROOT="${DUMP_ROOT:-${TMP_ROOT}/torchtitan_outputs}"
@@ -26,9 +27,10 @@ RUN_NAME="${RUN_NAME:-nanogpt_contrastive_ntp_muon_bf16_seq20k}"
 SEQ_LEN="${SEQ_LEN:-20000}"
 STEPS="${STEPS:-50000}"
 LOCAL_BATCH_SIZE="${LOCAL_BATCH_SIZE:-1}"
-GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-1}"
+GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:--1}"
 DTYPE="${DTYPE:-bfloat16}"
 LOG_FREQ="${LOG_FREQ:-50}"
+NPROC_PER_NODE="${NPROC_PER_NODE:-1}"
 
 OPTIMIZER_NAME="${OPTIMIZER_NAME:-MuonAdamW}"
 LR="${LR:-3e-4}"
@@ -52,10 +54,11 @@ Usage:
   bash scripts/remote_contrastive_ntp.sh all
 
 Defaults are non-root:
-  REPO_DIR=$HOME/torchtitan
-  TMP_ROOT=$HOME/torchtitan_tmp
-  DATA_DIR=$HOME/torchtitan_tmp/modded-nanogpt/data/fineweb10B
-  DUMP_ROOT=$HOME/torchtitan_tmp/torchtitan_outputs
+  APP_ROOT=$HOME/app
+  REPO_DIR=$HOME/app/torchtitan
+  TMP_ROOT=$HOME/app/torchtitan_tmp
+  DATA_DIR=$HOME/app/torchtitan_tmp/modded-nanogpt/data/fineweb10B
+  DUMP_ROOT=$HOME/app/torchtitan_tmp/torchtitan_outputs
   PYPI_INDEX=https://mirrors.aliyun.com/pypi/simple/
 
 Common overrides:
@@ -63,6 +66,7 @@ Common overrides:
   PYTHON_BIN=$HOME/miniconda3/bin/python
   NUM_TRAIN_SHARDS=9                   smaller data download for smoke
   HF_ENDPOINT=https://hf-mirror.com    optional Hugging Face mirror
+  NPROC_PER_NODE=4                     pure DP multi-GPU launch
   SEQ_LEN=20000 STEPS=50000
   OPTIMIZER_NAME=AdamW                 use AdamW instead of MuonAdamW
   BACKGROUND=0                         foreground training
@@ -265,7 +269,7 @@ start_train() {
 
   local train_cmd=(
     "${VENV_DIR}/bin/python" -m torch.distributed.run
-    --nproc_per_node=1
+    --nproc_per_node="${NPROC_PER_NODE}"
     --rdzv_backend c10d
     --rdzv_endpoint=localhost:0
     -m torchtitan.train

@@ -291,7 +291,7 @@ class BaseLoss(ABC, Configurable):
         self,
         pred: torch.Tensor,
         labels: torch.Tensor,
-        global_valid_tokens: torch.Tensor | None = None,
+        global_valid_tokens: torch.Tensor | float | None = None,
     ) -> torch.Tensor:
         loss = self.fn(pred, labels)
         if global_valid_tokens is not None:
@@ -397,7 +397,12 @@ class ContrastiveNTPLoss(BaseLoss):
         )
         self.last_metrics = metrics
         if global_valid_tokens is not None:
-            if global_valid_tokens.item() > 0:
+            valid_tokens = (
+                float(global_valid_tokens.item())
+                if isinstance(global_valid_tokens, torch.Tensor)
+                else float(global_valid_tokens)
+            )
+            if valid_tokens > 0:
                 loss = loss / global_valid_tokens
         return loss
 
