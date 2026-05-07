@@ -129,8 +129,8 @@ Default training is:
 
 - `llama3_nanogpt_contrastive_ntp`
 - causal SDPA, no row/document isolation mask
-- symmetric contrastive loss: context-to-token CE plus token-to-context
-  multi-positive InfoNCE
+- contrastive loss direction defaults to `bidirectional`: h2t/context-to-token
+  CE plus t2c/token-to-context multi-positive InfoNCE
 - batch-local unique target token candidates
 - `seq_len=20000`
 - `local_batch_size=1`
@@ -164,6 +164,18 @@ For AdamW instead of Muon:
 ```bash
 OPTIMIZER_NAME=AdamW bash scripts/remote_contrastive_ntp.sh train
 ```
+
+To train only one contrastive direction, set `LOSS_DIRECTION`:
+
+```bash
+LOSS_DIRECTION=h2t bash scripts/remote_contrastive_ntp.sh train
+LOSS_DIRECTION=t2c bash scripts/remote_contrastive_ntp.sh train
+LOSS_DIRECTION=bidirectional bash scripts/remote_contrastive_ntp.sh train
+```
+
+The underlying TorchTitan CLI arg is `--loss.direction`; accepted values are
+`h2t`, `t2c`, and `bidirectional`. `lambda_t2c` only weights the t2c term in
+`bidirectional` mode.
 
 TorchTitan's `TrainingConfig` currently exposes `bfloat16` and `float32`; this
 run uses `bfloat16` as the normal non-FP8 training mode.
@@ -216,6 +228,7 @@ CUDA_VISIBLE_DEVICES=0 "$VENV_DIR/bin/python" scripts/eval_contrastive_ntp_datas
   --max_eval_sequences 8 \
   --num_prompts 3 \
   --prompt_tokens 32 \
+  --direction bidirectional \
   --dtype bfloat16 \
   > "$EVAL_OUT/train_indomain.json"
 
@@ -226,6 +239,7 @@ CUDA_VISIBLE_DEVICES=0 "$VENV_DIR/bin/python" scripts/eval_contrastive_ntp_datas
   --max_eval_sequences 8 \
   --num_prompts 3 \
   --prompt_tokens 32 \
+  --direction bidirectional \
   --dtype bfloat16 \
   > "$EVAL_OUT/val_heldout.json"
 ```
@@ -234,6 +248,8 @@ The JSON files contain `mean_metrics.loss`, `mean_metrics.loss_c2t`,
 `mean_metrics.loss_t2c`, `mean_metrics.local_acc`,
 `mean_metrics.local_acc5`, `mean_metrics.num_candidates`,
 `mean_metrics.num_queries`, and `mean_metrics.random_top1_baseline`.
+Pass `--direction h2t`, `--direction t2c`, or `--direction bidirectional` to
+make the reported `mean_metrics.loss` match the trained objective.
 
 Run OOD prompt ranking/generation with the same checkpoint directory:
 
@@ -314,6 +330,7 @@ CUDA_VISIBLE_DEVICES=0 "$VENV_DIR/bin/python" scripts/eval_contrastive_ntp_datas
   --max_eval_sequences 8 \
   --num_prompts 3 \
   --prompt_tokens 32 \
+  --direction bidirectional \
   --dtype bfloat16 \
   > "$EVAL_OUT/val_heldout.json"
 
@@ -331,8 +348,8 @@ CUDA_VISIBLE_DEVICES=0 "$VENV_DIR/bin/python" scripts/contrastive_ntp_infer.py \
 ## 8. Notes
 
 `--dataloader.no-align-to-bos` means samples are contiguous `seq_len` windows
-over the token stream. The candidate set for both contrastive directions is the
-unique target token ids inside the current 20K-token window.
+over the token stream. The candidate set for the enabled contrastive
+direction(s) is the unique target token ids inside the current 20K-token window.
 
 This is not a full-vocabulary language model objective. Do not use perplexity as
 the primary metric; use local contrastive accuracy and candidate count.

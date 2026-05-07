@@ -121,6 +121,7 @@ def _sequence_metrics(
     tau: float,
     normalize: bool,
     lambda_t2c: float,
+    direction: str,
 ) -> dict[str, float]:
     hidden = model(input_ids)
     loss, metrics = _contrastive_ntp_loss_from_hidden(
@@ -130,6 +131,7 @@ def _sequence_metrics(
         tau=tau,
         normalize=normalize,
         lambda_t2c=lambda_t2c,
+        direction=direction,
         ignore_index=None,
         reduction="mean",
     )
@@ -247,6 +249,13 @@ def main() -> None:
     parser.add_argument("--no_normalize", action="store_true")
     parser.add_argument("--lambda_t2c", type=float, default=1.0)
     parser.add_argument(
+        "--direction",
+        "--loss_direction",
+        choices=("h2t", "t2c", "bidirectional"),
+        default="bidirectional",
+        help="Contrastive loss direction used for reported loss.",
+    )
+    parser.add_argument(
         "--device",
         default="cuda" if torch.cuda.is_available() else "cpu",
     )
@@ -301,6 +310,7 @@ def main() -> None:
                     tau=args.tau,
                     normalize=normalize,
                     lambda_t2c=args.lambda_t2c,
+                    direction=args.direction,
                 )
             )
 
@@ -336,6 +346,7 @@ def main() -> None:
             "tau": args.tau,
             "normalize": normalize,
             "lambda_t2c": args.lambda_t2c,
+            "direction": args.direction,
             "device": str(device),
             "dtype": args.dtype,
             "valid_vocab_size": args.valid_vocab_size,

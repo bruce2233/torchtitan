@@ -31,6 +31,7 @@ GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:--1}"
 DTYPE="${DTYPE:-bfloat16}"
 LOG_FREQ="${LOG_FREQ:-50}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-1}"
+LOSS_DIRECTION="${LOSS_DIRECTION:-bidirectional}"
 
 OPTIMIZER_NAME="${OPTIMIZER_NAME:-MuonAdamW}"
 LR="${LR:-3e-4}"
@@ -68,6 +69,7 @@ Common overrides:
   HF_ENDPOINT=https://hf-mirror.com    optional Hugging Face mirror
   NPROC_PER_NODE=4                     pure DP multi-GPU launch
   SEQ_LEN=20000 STEPS=50000
+  LOSS_DIRECTION=h2t                   h2t, t2c, or bidirectional
   OPTIMIZER_NAME=AdamW                 use AdamW instead of MuonAdamW
   BACKGROUND=0                         foreground training
 EOF
@@ -284,6 +286,7 @@ start_train() {
     --training.seq_len "${SEQ_LEN}"
     --training.steps "${STEPS}"
     --training.dtype "${DTYPE}"
+    --loss.direction "${LOSS_DIRECTION}"
     --metrics.log_freq "${LOG_FREQ}"
     "${checkpoint_args[@]}"
   )

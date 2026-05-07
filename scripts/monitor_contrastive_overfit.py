@@ -150,6 +150,8 @@ def _run_final_eval(args: argparse.Namespace, checkpoint_step: int) -> None:
         str(args.tau),
         "--lambda_t2c",
         str(args.lambda_t2c),
+        "--direction",
+        args.direction,
         "--dtype",
         args.dtype,
     ]
@@ -182,6 +184,11 @@ def main() -> None:
     parser.add_argument("--top_k", type=int, default=10)
     parser.add_argument("--tau", type=float, default=0.07)
     parser.add_argument("--lambda_t2c", type=float, default=1.0)
+    parser.add_argument(
+        "--direction",
+        choices=("h2t", "t2c", "bidirectional"),
+        default="bidirectional",
+    )
     parser.add_argument("--dtype", default="bfloat16")
     args = parser.parse_args()
 

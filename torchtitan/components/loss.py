@@ -17,8 +17,31 @@ from torchtitan.tools.logging import logger
 
 # PyTorch's default ignore index for cross-entropy loss
 IGNORE_INDEX = -100
+CONTRASTIVE_LOSS_DIRECTIONS = ("h2t", "t2c", "bidirectional")
 
 LossFunction: TypeAlias = Callable[..., torch.Tensor]
+
+
+def _canonical_contrastive_direction(direction: str) -> str:
+    normalized = direction.lower().replace("-", "_")
+    aliases = {
+        "h2t": "h2t",
+        "hidden_to_token": "h2t",
+        "context_to_token": "h2t",
+        "c2t": "h2t",
+        "t2c": "t2c",
+        "token_to_context": "t2c",
+        "bidirectional": "bidirectional",
+        "symmetric": "bidirectional",
+        "both": "bidirectional",
+    }
+    if normalized not in aliases:
+        supported = ", ".join(CONTRASTIVE_LOSS_DIRECTIONS)
+        raise ValueError(
+            f"Unsupported ContrastiveNTPLoss direction: {direction!r}. "
+            f"Supported values are: {supported}."
+        )
+    return aliases[normalized]
 
 
 def cross_entropy_loss(pred: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
@@ -125,6 +148,7 @@ def _contrastive_ntp_loss_from_hidden(
     pad_id: int | None = None,
     normalize: bool = True,
     lambda_t2c: float = 1.0,
+    direction: str = "bidirectional",
     ignore_index: int | None = IGNORE_INDEX,
     reduction: str = "mean",
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
@@ -135,6 +159,7 @@ def _contrastive_ntp_loss_from_hidden(
         raise ValueError(f"lambda_t2c must be non-negative, got {lambda_t2c}")
     if reduction not in {"mean", "sum"}:
         raise ValueError(f"Unsupported reduction for ContrastiveNTPLoss: {reduction}")
+    direction = _canonical_contrastive_direction(direction)
 
     queries, targets = _flatten_valid_contrastive_targets(
         hidden_states,
@@ -161,22 +186,44 @@ def _contrastive_ntp_loss_from_hidden(
 
     logits = queries @ candidate_emb.T
     logits = logits / tau
-    loss_c2t_sum = F.cross_entropy(
-        logits.float(),
-        candidate_labels,
-        reduction="sum",
-    )
     num_queries = targets.numel()
+
+    include_h2t = direction in {"h2t", "bidirectional"}
+    include_t2c = direction in {"t2c", "bidirectional"}
+    zero = logits.sum() * 0.0
+
+    if include_h2t:
+        loss_c2t_sum = F.cross_entropy(
+            logits.float(),
+            candidate_labels,
+            reduction="sum",
+        )
+    else:
+        loss_c2t_sum = zero
     loss_c2t = loss_c2t_sum / num_queries
-    loss_t2c = _token_to_context_loss(logits, candidate_labels)
+
+    if include_t2c:
+        loss_t2c = _token_to_context_loss(logits, candidate_labels)
+    else:
+        loss_t2c = zero
 
     if reduction == "sum":
         # Trainer divides by global valid tokens later. Scale the unique-token
         # averaged t2c term by the local query count so the effective objective
         # is mean(c2t) + lambda_t2c * mean(t2c).
-        loss = loss_c2t_sum + lambda_t2c * loss_t2c * num_queries
+        if direction == "h2t":
+            loss = loss_c2t_sum
+        elif direction == "t2c":
+            loss = loss_t2c * num_queries
+        else:
+            loss = loss_c2t_sum + lambda_t2c * loss_t2c * num_queries
     else:
-        loss = loss_c2t + lambda_t2c * loss_t2c
+        if direction == "h2t":
+            loss = loss_c2t
+        elif direction == "t2c":
+            loss = loss_t2c
+        else:
+            loss = loss_c2t + lambda_t2c * loss_t2c
 
     with torch.no_grad():
         pred = logits.argmax(dim=-1)
@@ -209,14 +256,15 @@ def contrastive_ntp_loss(
     pad_id: int | None = None,
     normalize: bool = True,
     lambda_t2c: float = 1.0,
+    direction: str = "bidirectional",
     return_metrics: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    """Symmetric batch-local unique-token contrastive next-token prediction.
+    """Batch-local unique-token contrastive next-token prediction.
 
     This standalone helper follows the original experiment definition:
     one causal forward over ``input_ids``, then ``hidden[:, :-1]`` predicts
-    ``input_ids[:, 1:]`` inside the batch-local unique target-token set. It
-    computes context->token CE plus multi-positive token->context InfoNCE.
+    ``input_ids[:, 1:]`` inside the batch-local unique target-token set. The
+    objective direction can be ``h2t``, ``t2c``, or ``bidirectional``.
     """
     hidden_states = _unwrap_hidden_states(transformer(input_ids))
     queries = hidden_states[:, :-1, :]
@@ -229,6 +277,7 @@ def contrastive_ntp_loss(
         pad_id=pad_id,
         normalize=normalize,
         lambda_t2c=lambda_t2c,
+        direction=direction,
         ignore_index=None,
         reduction="mean",
     )
@@ -245,6 +294,7 @@ def contrastive_ntp_loss_with_metrics(
     pad_id: int | None = None,
     normalize: bool = True,
     lambda_t2c: float = 1.0,
+    direction: str = "bidirectional",
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Standalone contrastive NTP helper that always returns debug metrics."""
     loss, metrics = contrastive_ntp_loss(
@@ -255,6 +305,7 @@ def contrastive_ntp_loss_with_metrics(
         pad_id=pad_id,
         normalize=normalize,
         lambda_t2c=lambda_t2c,
+        direction=direction,
         return_metrics=True,
     )
     return loss, metrics
@@ -324,13 +375,14 @@ class MSELoss(BaseLoss):
 
 
 class ContrastiveNTPLoss(BaseLoss):
-    """Symmetric batch-local unique-token contrastive next-token prediction.
+    """Batch-local unique-token contrastive next-token prediction.
 
     TorchTitan text dataloaders already return shifted ``labels``. This loss
     therefore expects ``pred`` to be decoder hidden states [B, T, D] produced
     with the model's ``lm_head`` skipped, and uses ``labels`` [B, T] as the
-    next-token targets. The objective is context->token CE plus weighted
-    multi-positive token->context InfoNCE.
+    next-token targets. The objective can be hidden/context-to-token CE,
+    multi-positive token-to-context InfoNCE, or their weighted bidirectional
+    combination.
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -345,7 +397,10 @@ class ContrastiveNTPLoss(BaseLoss):
         """Optional pad token id to exclude from the target candidate set."""
 
         lambda_t2c: float = 1.0
-        """Weight for the token-to-context multi-positive InfoNCE direction."""
+        """Weight for t2c in bidirectional mode."""
+
+        direction: str = "bidirectional"
+        """One of h2t, t2c, or bidirectional."""
 
     def __init__(
         self,
@@ -367,6 +422,7 @@ class ContrastiveNTPLoss(BaseLoss):
         self.normalize = config.normalize
         self.pad_id = config.pad_id
         self.lambda_t2c = config.lambda_t2c
+        self.direction = _canonical_contrastive_direction(config.direction)
         self.token_embedding: nn.Module | None = None
         self.last_metrics: dict[str, torch.Tensor] = {}
 
@@ -392,6 +448,7 @@ class ContrastiveNTPLoss(BaseLoss):
             pad_id=self.pad_id,
             normalize=self.normalize,
             lambda_t2c=self.lambda_t2c,
+            direction=self.direction,
             ignore_index=IGNORE_INDEX,
             reduction="sum",
         )

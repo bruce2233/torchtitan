@@ -123,6 +123,7 @@ def llama3_debugmodel_contrastive_ntp() -> Trainer.Config:
         tau=0.07,
         normalize=True,
         lambda_t2c=1.0,
+        direction="bidirectional",
     )
     config.optimizer = OptimizersContainer.Config(lr=3e-4)
     config.training = TrainingConfig(
@@ -184,6 +185,7 @@ def llama3_nanogpt_contrastive_ntp() -> Trainer.Config:
             tau=0.07,
             normalize=True,
             lambda_t2c=1.0,
+            direction="bidirectional",
         ),
         hf_assets_path="./tests/assets/tokenizer",
         dump_folder="./outputs/nanogpt_contrastive_ntp",

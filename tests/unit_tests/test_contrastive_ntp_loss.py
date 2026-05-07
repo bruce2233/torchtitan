@@ -157,7 +157,41 @@ class TestContrastiveNTPLoss(unittest.TestCase):
         self.assertGreater(metrics["loss_t2c"].item(), 0.0)
         self.assertTrue(torch.allclose(loss.detach(), expected, atol=1e-6))
 
-        c2t_only_loss, c2t_only_metrics = contrastive_ntp_loss_with_metrics(
+        h2t_loss, h2t_metrics = contrastive_ntp_loss_with_metrics(
+            input_ids=input_ids,
+            transformer=transformer,
+            token_embedding=token_embedding,
+            tau=0.07,
+            normalize=True,
+            direction="h2t",
+        )
+        self.assertTrue(
+            torch.allclose(
+                h2t_loss.detach(),
+                h2t_metrics["loss_c2t"],
+                atol=1e-6,
+            )
+        )
+        self.assertEqual(h2t_metrics["loss_t2c"].item(), 0.0)
+
+        t2c_loss, t2c_metrics = contrastive_ntp_loss_with_metrics(
+            input_ids=input_ids,
+            transformer=transformer,
+            token_embedding=token_embedding,
+            tau=0.07,
+            normalize=True,
+            direction="t2c",
+        )
+        self.assertTrue(
+            torch.allclose(
+                t2c_loss.detach(),
+                t2c_metrics["loss_t2c"],
+                atol=1e-6,
+            )
+        )
+        self.assertEqual(t2c_metrics["loss_c2t"].item(), 0.0)
+
+        lambda_zero_loss, lambda_zero_metrics = contrastive_ntp_loss_with_metrics(
             input_ids=input_ids,
             transformer=transformer,
             token_embedding=token_embedding,
@@ -167,11 +201,20 @@ class TestContrastiveNTPLoss(unittest.TestCase):
         )
         self.assertTrue(
             torch.allclose(
-                c2t_only_loss.detach(),
-                c2t_only_metrics["loss_c2t"],
+                lambda_zero_loss.detach(),
+                lambda_zero_metrics["loss_c2t"],
                 atol=1e-6,
             )
         )
+
+    def test_loss_direction_alias_and_validation(self):
+        h2t_loss = ContrastiveNTPLoss(
+            ContrastiveNTPLoss.Config(direction="c2t")
+        )
+        self.assertEqual(h2t_loss.direction, "h2t")
+
+        with self.assertRaisesRegex(ValueError, "Unsupported"):
+            ContrastiveNTPLoss(ContrastiveNTPLoss.Config(direction="bad"))
 
     def test_loss_accepts_float_global_valid_tokens(self):
         torch.manual_seed(789)
