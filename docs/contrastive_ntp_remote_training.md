@@ -191,7 +191,144 @@ $OUT/checkpoint/step-6000
 ...
 ```
 
-## 7. Notes
+## 7. Evaluate A Checkpoint
+
+The evaluation helpers load TorchTitan DCP checkpoint directories directly with
+`torch.distributed.checkpoint.load`. Do not convert `.distcp` files for this
+workflow; pass the checkpoint step directory to `--checkpoint`.
+
+### Single-GPU Training Checkpoint
+
+```bash
+cd ~/app/torchtitan
+
+export VENV_DIR=$HOME/app/torchtitan/.venv
+export DATA_DIR=$HOME/app/torchtitan_tmp/modded-nanogpt/data/fineweb10B
+export OUT=$HOME/app/torchtitan_tmp/torchtitan_outputs/nanogpt_contrastive_ntp_muon_bf16_seq20k_50k
+export CKPT=$OUT/checkpoint/step-15000
+export EVAL_OUT=$OUT/eval_step15000
+mkdir -p "$EVAL_OUT"
+
+CUDA_VISIBLE_DEVICES=0 "$VENV_DIR/bin/python" scripts/eval_contrastive_ntp_dataset.py \
+  --checkpoint "$CKPT" \
+  --data "$DATA_DIR/fineweb_train_000001.bin" \
+  --seq_len 20000 \
+  --max_eval_sequences 8 \
+  --num_prompts 3 \
+  --prompt_tokens 32 \
+  --dtype bfloat16 \
+  > "$EVAL_OUT/train_indomain.json"
+
+CUDA_VISIBLE_DEVICES=0 "$VENV_DIR/bin/python" scripts/eval_contrastive_ntp_dataset.py \
+  --checkpoint "$CKPT" \
+  --data "$DATA_DIR/fineweb_val_000000.bin" \
+  --seq_len 20000 \
+  --max_eval_sequences 8 \
+  --num_prompts 3 \
+  --prompt_tokens 32 \
+  --dtype bfloat16 \
+  > "$EVAL_OUT/val_heldout.json"
+```
+
+The JSON files contain `mean_metrics.loss`, `mean_metrics.loss_c2t`,
+`mean_metrics.loss_t2c`, `mean_metrics.local_acc`,
+`mean_metrics.local_acc5`, `mean_metrics.num_candidates`,
+`mean_metrics.num_queries`, and `mean_metrics.random_top1_baseline`.
+
+Run OOD prompt ranking/generation with the same checkpoint directory:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 "$VENV_DIR/bin/python" scripts/contrastive_ntp_infer.py \
+  --checkpoint "$CKPT" \
+  --prompt "The capital of France is" \
+  --top_k 20 \
+  --max_new_tokens 20 \
+  --max_context_tokens 2048 \
+  --dtype bfloat16 \
+  --json \
+  > "$EVAL_OUT/ood_capital_france.json"
+
+CUDA_VISIBLE_DEVICES=0 "$VENV_DIR/bin/python" scripts/contrastive_ntp_infer.py \
+  --checkpoint "$CKPT" \
+  --prompt "In a shocking finding, scientists discovered that" \
+  --top_k 20 \
+  --max_new_tokens 20 \
+  --max_context_tokens 2048 \
+  --dtype bfloat16 \
+  --json \
+  > "$EVAL_OUT/ood_science_news.json"
+```
+
+To print a compact metric summary:
+
+```bash
+"$VENV_DIR/bin/python" - "$EVAL_OUT/train_indomain.json" "$EVAL_OUT/val_heldout.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+for name in sys.argv[1:]:
+    payload = json.loads(Path(name).read_text())
+    metrics = payload["mean_metrics"]
+    print(Path(name).name)
+    for key in (
+        "loss",
+        "loss_c2t",
+        "loss_t2c",
+        "local_acc",
+        "local_acc5",
+        "num_candidates",
+        "num_queries",
+        "random_top1_baseline",
+    ):
+        print(f"  {key}: {metrics.get(key)}")
+PY
+```
+
+### Multi-GPU DP Training Checkpoint
+
+Pure DP training saves the same TorchTitan DCP checkpoint directory, but the
+step directory may contain multiple `__*.distcp` shard files:
+
+```text
+$OUT/checkpoint/step-15000/.metadata
+$OUT/checkpoint/step-15000/__0_0.distcp
+$OUT/checkpoint/step-15000/__1_0.distcp
+...
+```
+
+Use the exact same eval and inference commands as above. Set `CKPT` to the
+multi-GPU run's step directory; the scripts still run on one visible GPU and DCP
+reshards the saved tensors into the local unsharded eval model.
+
+```bash
+export OUT=$HOME/app/torchtitan_tmp/torchtitan_outputs/nanogpt_contrastive_ntp_muon_bf16_seq20k_50k_dp4
+export CKPT=$OUT/checkpoint/step-15000
+export EVAL_OUT=$OUT/eval_step15000
+mkdir -p "$EVAL_OUT"
+
+CUDA_VISIBLE_DEVICES=0 "$VENV_DIR/bin/python" scripts/eval_contrastive_ntp_dataset.py \
+  --checkpoint "$CKPT" \
+  --data "$DATA_DIR/fineweb_val_000000.bin" \
+  --seq_len 20000 \
+  --max_eval_sequences 8 \
+  --num_prompts 3 \
+  --prompt_tokens 32 \
+  --dtype bfloat16 \
+  > "$EVAL_OUT/val_heldout.json"
+
+CUDA_VISIBLE_DEVICES=0 "$VENV_DIR/bin/python" scripts/contrastive_ntp_infer.py \
+  --checkpoint "$CKPT" \
+  --prompt "The capital of France is" \
+  --top_k 20 \
+  --max_new_tokens 20 \
+  --max_context_tokens 2048 \
+  --dtype bfloat16 \
+  --json \
+  > "$EVAL_OUT/ood_capital_france.json"
+```
+
+## 8. Notes
 
 `--dataloader.no-align-to-bos` means samples are contiguous `seq_len` windows
 over the token stream. The candidate set for both contrastive directions is the
