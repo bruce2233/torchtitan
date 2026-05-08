@@ -13,6 +13,7 @@ from torchtitan.components.optimizer import OptimizersContainer
 from torchtitan.distributed.parallel_dims import ParallelDims
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.llama3 import model_registry, parallelize_llama
+from torchtitan.models.llama3.model import Llama3KeelTransformerBlock
 from torchtitan.protocols import BaseModel
 from torchtitan.protocols.model_spec import ModelSpec
 
@@ -62,6 +63,35 @@ class TestModelSpec:
         assert spec.flavor == "debugmodel"
         assert spec.model is not None
         assert spec.parallelize_fn == parallelize_llama
+
+    def test_keel_model_registry(self):
+        spec = model_registry("keel_debugmodel")
+        assert isinstance(spec, ModelSpec)
+        assert spec.flavor == "keel_debugmodel"
+        assert len(spec.model.layers) == 6
+
+        first_layer = spec.model.layers[0]
+        second_layer = spec.model.layers[1]
+        assert isinstance(first_layer, Llama3KeelTransformerBlock.Config)
+        assert first_layer.attention_post_norm is None
+        assert first_layer.attention_residual_scale == 1.0
+        assert first_layer.ffn_residual_scale == 1.0
+        assert second_layer.attention_post_norm is not None
+        assert second_layer.attention_residual_scale == 12.0
+        assert second_layer.ffn_residual_scale == 12.0
+
+    def test_keel_paper_depth_config(self):
+        spec = model_registry("keel_512x1024")
+        assert len(spec.model.layers) == 256
+        assert spec.model.dim == 1024
+        assert spec.model.rope.theta == 10000
+
+        first_layer = spec.model.layers[0]
+        last_layer = spec.model.layers[-1]
+        assert first_layer.feed_forward.w1.out_features == 3072
+        assert first_layer.attention_post_norm is None
+        assert last_layer.attention_residual_scale == 512.0
+        assert last_layer.ffn_residual_scale == 512.0
 
     def test_model_spec_creation(self):
         fake_config = FakeModel.Config()

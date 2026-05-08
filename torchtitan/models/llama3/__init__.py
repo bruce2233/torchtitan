@@ -27,7 +27,7 @@ from torchtitan.models.common.config_utils import (
 from torchtitan.models.common.param_init import depth_scaled_std, skip_param_init
 from torchtitan.protocols.model_spec import ModelSpec
 
-from .model import Llama3Model, Llama3TransformerBlock
+from .model import Llama3KeelTransformerBlock, Llama3Model, Llama3TransformerBlock
 from .parallelize import parallelize_llama
 from .state_dict_adapter import Llama3StateDictAdapter
 
@@ -42,8 +42,13 @@ _LINEAR_INIT = {
     "weight": partial(nn.init.trunc_normal_, std=0.02),
     "bias": nn.init.zeros_,
 }
+_PAPER_LINEAR_INIT = {
+    "weight": partial(nn.init.normal_, std=0.02),
+    "bias": nn.init.zeros_,
+}
 _NORM_INIT = {"weight": nn.init.ones_}
 _EMBEDDING_INIT = {"weight": partial(nn.init.normal_, std=1.0)}
+_PAPER_EMBEDDING_INIT = {"weight": partial(nn.init.normal_, std=0.02)}
 _EMBEDDING_SKIP_INIT = {"weight": skip_param_init}
 
 
@@ -62,6 +67,10 @@ def _depth_init(layer_id: int) -> dict[str, Callable]:
     }
 
 
+def _norm_config(dim: int) -> RMSNorm.Config:
+    return RMSNorm.Config(normalized_shape=dim, param_init=_NORM_INIT)
+
+
 def _build_llama3_layers(
     *,
     n_layers: int,
@@ -71,23 +80,26 @@ def _build_llama3_layers(
     n_kv_heads: int | None = None,
     fuse_qkv: bool = False,
     attn_backend: str,
+    depth_scaled_init: bool = True,
 ) -> list[TransformerBlock.Config]:
     """Build a list of per-layer TransformerBlock configs with depth-scaled inits."""
     inner_attention, mask_type = get_attention_config(attn_backend)
     layers = []
     for layer_id in range(n_layers):
+        base_param_init = _LINEAR_INIT if depth_scaled_init else _PAPER_LINEAR_INIT
+        output_param_init = (
+            _depth_init(layer_id) if depth_scaled_init else _PAPER_LINEAR_INIT
+        )
         layers.append(
             Llama3TransformerBlock.Config(
-                attention_norm=RMSNorm.Config(
-                    normalized_shape=dim, param_init=_NORM_INIT
-                ),
-                ffn_norm=RMSNorm.Config(normalized_shape=dim, param_init=_NORM_INIT),
+                attention_norm=_norm_config(dim),
+                ffn_norm=_norm_config(dim),
                 attention=make_gqa_config(
                     dim=dim,
                     n_heads=n_heads,
                     n_kv_heads=n_kv_heads,
-                    wqkv_param_init=_LINEAR_INIT,
-                    wo_param_init=_depth_init(layer_id),
+                    wqkv_param_init=base_param_init,
+                    wo_param_init=output_param_init,
                     inner_attention=inner_attention,
                     fuse_qkv=fuse_qkv,
                     mask_type=mask_type,
@@ -96,8 +108,55 @@ def _build_llama3_layers(
                 feed_forward=make_ffn_config(
                     dim=dim,
                     hidden_dim=hidden_dim,
-                    w1_param_init=_LINEAR_INIT,
-                    w2w3_param_init=_depth_init(layer_id),
+                    w1_param_init=base_param_init,
+                    w2w3_param_init=output_param_init,
+                ),
+            )
+        )
+    return layers
+
+
+def _build_llama3_keel_layers(
+    *,
+    n_layers: int,
+    dim: int,
+    n_heads: int,
+    hidden_dim: int,
+    n_kv_heads: int | None = None,
+    fuse_qkv: bool = False,
+    attn_backend: str,
+    residual_scale: float | None = None,
+) -> list[TransformerBlock.Config]:
+    """Build KEEL layers. ``n_layers`` is Transformer blocks, so sub-layers = 2x."""
+    inner_attention, mask_type = get_attention_config(attn_backend)
+    alpha = float(residual_scale if residual_scale is not None else 2 * n_layers)
+    layers = []
+    for layer_id in range(n_layers):
+        is_first_block = layer_id == 0
+        layers.append(
+            Llama3KeelTransformerBlock.Config(
+                attention_norm=_norm_config(dim),
+                ffn_norm=_norm_config(dim),
+                attention_post_norm=None if is_first_block else _norm_config(dim),
+                ffn_post_norm=_norm_config(dim),
+                attention_residual_scale=1.0 if is_first_block else alpha,
+                ffn_residual_scale=1.0 if is_first_block else alpha,
+                attention=make_gqa_config(
+                    dim=dim,
+                    n_heads=n_heads,
+                    n_kv_heads=n_kv_heads,
+                    wqkv_param_init=_PAPER_LINEAR_INIT,
+                    wo_param_init=_PAPER_LINEAR_INIT,
+                    inner_attention=inner_attention,
+                    fuse_qkv=fuse_qkv,
+                    mask_type=mask_type,
+                    rope_backend="complex",
+                ),
+                feed_forward=make_ffn_config(
+                    dim=dim,
+                    hidden_dim=hidden_dim,
+                    w1_param_init=_PAPER_LINEAR_INIT,
+                    w2w3_param_init=_PAPER_LINEAR_INIT,
                 ),
             )
         )
@@ -126,6 +185,37 @@ def _debugmodel(attn_backend: str) -> Llama3Model.Config:
             scaling="llama",
         ),
         layers=_build_llama3_layers(
+            n_layers=n_layers,
+            dim=dim,
+            n_heads=n_heads,
+            hidden_dim=compute_ffn_hidden_dim(dim, multiple_of=256),
+            attn_backend=attn_backend,
+        ),
+    )
+
+
+def _keel_debugmodel(attn_backend: str) -> Llama3Model.Config:
+    dim = 256
+    n_heads = 16
+    n_layers = 6
+    return Llama3Model.Config(
+        dim=dim,
+        vocab_size=2048,
+        tok_embeddings=Embedding.Config(
+            num_embeddings=2048, embedding_dim=dim, param_init=_EMBEDDING_INIT
+        ),
+        norm=_norm_config(dim),
+        lm_head=Linear.Config(
+            in_features=dim, out_features=2048, param_init=_output_linear_init(dim)
+        ),
+        rope=RoPE.Config(
+            dim=dim // n_heads,
+            max_seq_len=131072,
+            theta=500000,
+            backend="complex",
+            scaling="llama",
+        ),
+        layers=_build_llama3_keel_layers(
             n_layers=n_layers,
             dim=dim,
             n_heads=n_heads,
@@ -167,14 +257,19 @@ def _debugmodel_fused_qkv(attn_backend: str) -> Llama3Model.Config:
     )
 
 
-def _nanogpt_smoke(attn_backend: str) -> Llama3Model.Config:
+def _nanogpt_smoke_model(
+    attn_backend: str,
+    *,
+    n_layers: int,
+    dim: int = 768,
+    n_heads: int = 12,
+    use_keel: bool = False,
+) -> Llama3Model.Config:
     # modded-nanogpt uses GPT-2 tokens with 50,257 ids padded to 50,304.
-    # Use the GPT-2-small scale: 12 layers, width 768, tied input/output
-    # embeddings. Without tying, the padded 50k vocab adds ~38.6M parameters.
-    dim = 768
-    n_heads = 12
-    n_layers = 12
+    # Use GPT-2-style tied input/output embeddings. Without tying, the padded
+    # 50k vocab adds vocab_size * dim parameters.
     vocab_size = 50304
+    build_layers = _build_llama3_keel_layers if use_keel else _build_llama3_layers
     return Llama3Model.Config(
         dim=dim,
         vocab_size=vocab_size,
@@ -197,13 +292,140 @@ def _nanogpt_smoke(attn_backend: str) -> Llama3Model.Config:
             backend="complex",
             scaling="llama",
         ),
-        layers=_build_llama3_layers(
+        layers=build_layers(
             n_layers=n_layers,
             dim=dim,
             n_heads=n_heads,
             hidden_dim=compute_ffn_hidden_dim(dim, multiple_of=256),
             attn_backend=attn_backend,
         ),
+    )
+
+
+def _nanogpt_smoke(attn_backend: str) -> Llama3Model.Config:
+    return _nanogpt_smoke_model(attn_backend, n_layers=12)
+
+
+def _nanogpt_smoke_24layer(attn_backend: str) -> Llama3Model.Config:
+    return _nanogpt_smoke_model(attn_backend, n_layers=24)
+
+
+def _nanogpt_smoke_48layer(attn_backend: str) -> Llama3Model.Config:
+    return _nanogpt_smoke_model(attn_backend, n_layers=48)
+
+
+def _nanogpt_smoke_384x192(attn_backend: str) -> Llama3Model.Config:
+    return _nanogpt_smoke_model(attn_backend, n_layers=192, dim=384)
+
+
+def _keel_gpt2_smoke(attn_backend: str) -> Llama3Model.Config:
+    return _nanogpt_smoke_model(attn_backend, n_layers=12, use_keel=True)
+
+
+def _keel_gpt2_512x256(attn_backend: str) -> Llama3Model.Config:
+    return _nanogpt_smoke_model(
+        attn_backend, n_layers=256, dim=512, n_heads=8, use_keel=True
+    )
+
+
+def _paper_depth_model(
+    attn_backend: str,
+    *,
+    n_sublayers: int,
+    dim: int,
+    use_keel: bool,
+) -> Llama3Model.Config:
+    assert n_sublayers % 2 == 0, (
+        "KEEL/Pre-LN depth counts Attention and FFN sub-layers"
+    )
+    n_blocks = n_sublayers // 2
+    n_heads = 16
+    n_kv_heads = 8
+    vocab_size = 128256
+    hidden_dim = 3 * dim
+    build_layers = _build_llama3_keel_layers if use_keel else _build_llama3_layers
+    layer_kwargs = {}
+    if not use_keel:
+        layer_kwargs["depth_scaled_init"] = False
+    return Llama3Model.Config(
+        dim=dim,
+        vocab_size=vocab_size,
+        enable_weight_tying=True,
+        tok_embeddings=Embedding.Config(
+            num_embeddings=vocab_size,
+            embedding_dim=dim,
+            param_init=_PAPER_EMBEDDING_INIT,
+        ),
+        norm=_norm_config(dim),
+        lm_head=Linear.Config(
+            in_features=dim,
+            out_features=vocab_size,
+            param_init=_PAPER_LINEAR_INIT,
+        ),
+        rope=RoPE.Config(
+            dim=dim // n_heads,
+            max_seq_len=4096,
+            theta=10000,
+            backend="complex",
+            scaling=None,
+        ),
+        layers=build_layers(
+            n_layers=n_blocks,
+            dim=dim,
+            n_heads=n_heads,
+            n_kv_heads=n_kv_heads,
+            hidden_dim=hidden_dim,
+            attn_backend=attn_backend,
+            **layer_kwargs,
+        ),
+    )
+
+
+def _keel_64x1024(attn_backend: str) -> Llama3Model.Config:
+    return _paper_depth_model(
+        attn_backend, n_sublayers=64, dim=1024, use_keel=True
+    )
+
+
+def _keel_256x1024(attn_backend: str) -> Llama3Model.Config:
+    return _paper_depth_model(
+        attn_backend, n_sublayers=256, dim=1024, use_keel=True
+    )
+
+
+def _keel_512x1024(attn_backend: str) -> Llama3Model.Config:
+    return _paper_depth_model(
+        attn_backend, n_sublayers=512, dim=1024, use_keel=True
+    )
+
+
+def _keel_1024x1024(attn_backend: str) -> Llama3Model.Config:
+    return _paper_depth_model(
+        attn_backend, n_sublayers=1024, dim=1024, use_keel=True
+    )
+
+
+def _preln_64x1024(attn_backend: str) -> Llama3Model.Config:
+    return _paper_depth_model(
+        attn_backend, n_sublayers=64, dim=1024, use_keel=False
+    )
+
+
+def _preln_256x1024(attn_backend: str) -> Llama3Model.Config:
+    return _paper_depth_model(
+        attn_backend, n_sublayers=256, dim=1024, use_keel=False
+    )
+
+
+def _preln_512x1024(attn_backend: str) -> Llama3Model.Config:
+    return _paper_depth_model(
+        attn_backend, n_sublayers=512, dim=1024, use_keel=False
+    )
+
+
+def _preln_1024x1024(attn_backend: str) -> Llama3Model.Config:
+    return _paper_depth_model(
+        attn_backend, n_sublayers=1024, dim=1024, use_keel=False
     )
 
 
@@ -405,8 +627,22 @@ def _405b(attn_backend: str) -> Llama3Model.Config:
 
 llama3_configs = {
     "debugmodel": _debugmodel,
+    "keel_debugmodel": _keel_debugmodel,
     "debugmodel_fused_qkv": _debugmodel_fused_qkv,
     "nanogpt_smoke": _nanogpt_smoke,
+    "nanogpt_smoke_24layer": _nanogpt_smoke_24layer,
+    "nanogpt_smoke_48layer": _nanogpt_smoke_48layer,
+    "nanogpt_smoke_384x192": _nanogpt_smoke_384x192,
+    "keel_gpt2_smoke": _keel_gpt2_smoke,
+    "keel_gpt2_512x256": _keel_gpt2_512x256,
+    "keel_64x1024": _keel_64x1024,
+    "keel_256x1024": _keel_256x1024,
+    "keel_512x1024": _keel_512x1024,
+    "keel_1024x1024": _keel_1024x1024,
+    "preln_64x1024": _preln_64x1024,
+    "preln_256x1024": _preln_256x1024,
+    "preln_512x1024": _preln_512x1024,
+    "preln_1024x1024": _preln_1024x1024,
     "1B": _1b,
     "3B": _3b,
     "8B": _8b,
@@ -424,6 +660,9 @@ def model_registry(
     if quantization is not None:
         for q in quantization:
             q.build().convert(config)
+    state_dict_adapter = (
+        None if flavor.startswith(("keel_", "preln_")) else Llama3StateDictAdapter
+    )
     return ModelSpec(
         name="llama3",
         flavor=flavor,
@@ -431,5 +670,5 @@ def model_registry(
         parallelize_fn=parallelize_llama,
         pipelining_fn=pipeline_llm,
         post_optimizer_build_fn=None,
-        state_dict_adapter=Llama3StateDictAdapter,
+        state_dict_adapter=state_dict_adapter,
     )

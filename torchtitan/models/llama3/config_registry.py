@@ -71,6 +71,14 @@ def llama3_debugmodel() -> Trainer.Config:
     )
 
 
+def llama3_keel_debugmodel() -> Trainer.Config:
+    """Debug config that swaps the Llama3 block for the KEEL Post-LN block."""
+    config = llama3_debugmodel()
+    config.dump_folder = "./outputs/keel_debugmodel"
+    config.model_spec = model_registry("keel_debugmodel")
+    return config
+
+
 def llama3_debugmodel_fused_qkv() -> Trainer.Config:
     config = llama3_debugmodel()
     config.model_spec = model_registry("debugmodel_fused_qkv")
@@ -189,6 +197,83 @@ def llama3_nanogpt_smoke_fineweb_edu_text() -> Trainer.Config:
     return config
 
 
+def llama3_keel_gpt2_smoke_fineweb_edu_text() -> Trainer.Config:
+    """KEEL smoke config using GPT-2 tokens and FineWeb-Edu online tokenization."""
+    config = llama3_nanogpt_smoke_fineweb_edu_text()
+    config.hf_assets_path = "./outputs/gpt2_tokenizer"
+    config.dump_folder = "./outputs/keel_gpt2_smoke_fineweb_edu_1000"
+    config.model_spec = model_registry("keel_gpt2_smoke")
+    config.training = TrainingConfig(
+        local_batch_size=1,
+        global_batch_size=1,
+        seq_len=2048,
+        steps=1000,
+        gc_freq=50,
+    )
+    config.metrics = MetricsProcessor.Config(log_freq=10)
+    config.checkpoint = CheckpointManager.Config(
+        enable=True,
+        interval=200,
+        last_save_model_only=False,
+        keep_latest_k=5,
+    )
+    config.activation_checkpoint = ActivationCheckpointConfig(mode="none")
+    return config
+
+
+def llama3_keel_gpt2_512x256_fineweb_edu_text() -> Trainer.Config:
+    """256-layer KEEL GPT-2-token config for FineWeb-Edu online tokenization."""
+    config = llama3_nanogpt_smoke_fineweb_edu_text()
+    config.hf_assets_path = "./outputs/gpt2_tokenizer"
+    config.dump_folder = "./outputs/keel_gpt2_512x256_fineweb_edu_1000"
+    config.model_spec = model_registry("keel_gpt2_512x256")
+    config.optimizer = OptimizersContainer.Config(
+        lr=3e-4,
+        weight_decay=0.1,
+    )
+    config.training = TrainingConfig(
+        local_batch_size=1,
+        global_batch_size=1,
+        seq_len=2048,
+        steps=1000,
+        dtype="bfloat16",
+        gc_freq=50,
+    )
+    config.metrics = MetricsProcessor.Config(log_freq=10)
+    config.checkpoint = CheckpointManager.Config(
+        enable=True,
+        interval=1000,
+        last_save_model_only=False,
+        keep_latest_k=2,
+    )
+    config.activation_checkpoint = ActivationCheckpointConfig(mode="selective")
+    return config
+
+
+def llama3_nanogpt_smoke_24layer() -> Trainer.Config:
+    """FineWeb smoke config with twice the GPT-2-small layer count."""
+    config = llama3_nanogpt_smoke()
+    config.dump_folder = "./outputs/nanogpt_smoke_24layer"
+    config.model_spec = model_registry("nanogpt_smoke_24layer")
+    return config
+
+
+def llama3_nanogpt_smoke_48layer() -> Trainer.Config:
+    """FineWeb smoke config with 48 GPT-2-small-width transformer blocks."""
+    config = llama3_nanogpt_smoke()
+    config.dump_folder = "./outputs/nanogpt_smoke_48layer"
+    config.model_spec = model_registry("nanogpt_smoke_48layer")
+    return config
+
+
+def llama3_nanogpt_smoke_384x192() -> Trainer.Config:
+    """FineWeb smoke config with dim=384 and 192 transformer blocks."""
+    config = llama3_nanogpt_smoke()
+    config.dump_folder = "./outputs/nanogpt_smoke_384x192"
+    config.model_spec = model_registry("nanogpt_smoke_384x192")
+    return config
+
+
 def llama3_nanogpt_contrastive_ntp() -> Trainer.Config:
     """Batch-local contrastive NTP on modded-nanogpt FineWeb token shards."""
     return Trainer.Config(
@@ -294,6 +379,72 @@ def llama3_debugmodel_float8_emulate() -> Trainer.Config:
         ],
     )
     return config
+
+
+def _llama3_keel_paper_config(
+    *,
+    flavor: str,
+    peak_lr: float,
+    dump_folder: str,
+) -> Trainer.Config:
+    """Paper-scale KEEL/Pre-LN setup from arXiv:2601.19895v2, using C4 by default."""
+    return Trainer.Config(
+        loss=ChunkedCELoss.Config(),
+        hf_assets_path="./assets/hf/Llama-3.1-8B",
+        dump_folder=dump_folder,
+        model_spec=model_registry(flavor),
+        dataloader=HuggingFaceTextDataLoader.Config(
+            dataset="c4",
+        ),
+        optimizer=OptimizersContainer.Config(
+            lr=peak_lr,
+            beta1=0.9,
+            beta2=0.95,
+            weight_decay=0.01,
+        ),
+        lr_scheduler=LRSchedulersContainer.Config(
+            warmup_steps=2500,
+            decay_type="cosine",
+            min_lr_factor=1.0e-7 / peak_lr,
+        ),
+        training=TrainingConfig(
+            local_batch_size=1,
+            global_batch_size=2048,
+            seq_len=4096,
+            steps=119210,
+            gc_freq=50,
+        ),
+        metrics=MetricsProcessor.Config(
+            log_freq=10,
+            enable_tensorboard=True,
+        ),
+        checkpoint=CheckpointManager.Config(
+            enable=True,
+            interval=2500,
+            last_save_model_only=False,
+        ),
+        activation_checkpoint=ActivationCheckpointConfig(mode="full"),
+        parallelism=ParallelismConfig(pipeline_parallel_schedule="Interleaved1F1B"),
+        validator=Validator.Config(enable=False),
+    )
+
+
+def llama3_keel_512x1024_1t() -> Trainer.Config:
+    """512-sub-layer KEEL paper-scale run: d_model=1024, peak LR=4.5e-3."""
+    return _llama3_keel_paper_config(
+        flavor="keel_512x1024",
+        peak_lr=4.5e-3,
+        dump_folder="./outputs/keel_512x1024_1t",
+    )
+
+
+def llama3_preln_512x1024_1t() -> Trainer.Config:
+    """512-sub-layer Pre-LN baseline from the paper: d_model=1024, peak LR=3e-3."""
+    return _llama3_keel_paper_config(
+        flavor="preln_512x1024",
+        peak_lr=3.0e-3,
+        dump_folder="./outputs/preln_512x1024_1t",
+    )
 
 
 def llama3_8b() -> Trainer.Config:

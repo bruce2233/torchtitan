@@ -14,6 +14,7 @@ from torch import nn
 
 from torchtitan.models.common.attention import AttentionMasksType, VarlenAttention
 from torchtitan.models.common.decoder import Decoder, TransformerBlock
+from torchtitan.models.common.rmsnorm import RMSNorm
 from torchtitan.models.utils import get_dense_model_nparams_and_flops
 from torchtitan.tools.logging import logger
 
@@ -52,6 +53,63 @@ class Llama3TransformerBlock(TransformerBlock):
             self.attention_norm(x), freqs_cis, attention_masks, positions
         )
         out = h + self.feed_forward(self.ffn_norm(h))
+        return out
+
+
+class Llama3KeelTransformerBlock(TransformerBlock):
+    """
+    Llama3 TransformerBlock with the KEEL Post-LN highway residual path.
+
+    KEEL applies each sub-layer as:
+        y = PostNorm(alpha * x + F(InnerNorm(x)))
+
+    The paper removes the first attention PostNorm, and removes alpha scaling
+    from both first attention and first FFN sub-layers.
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(TransformerBlock.Config):
+        attention_post_norm: RMSNorm.Config | None
+        ffn_post_norm: RMSNorm.Config
+        attention_residual_scale: float
+        ffn_residual_scale: float
+
+    def __init__(self, config: Config):
+        super().__init__()
+        self.attention = config.attention.build()
+        assert config.feed_forward is not None
+        self.feed_forward = config.feed_forward.build()
+        self.attention_norm = config.attention_norm.build()
+        self.ffn_norm = config.ffn_norm.build()
+        self.attention_post_norm = (
+            config.attention_post_norm.build()
+            if config.attention_post_norm is not None
+            else None
+        )
+        self.ffn_post_norm = config.ffn_post_norm.build()
+        self.attention_residual_scale = config.attention_residual_scale
+        self.ffn_residual_scale = config.ffn_residual_scale
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        freqs_cis: torch.Tensor,
+        attention_masks: AttentionMasksType | None,
+        positions: torch.Tensor | None = None,
+    ):
+        attention_out = self.attention(
+            self.attention_norm(x), freqs_cis, attention_masks, positions
+        )
+        if self.attention_post_norm is None:
+            h = x + attention_out
+        else:
+            h = self.attention_post_norm(
+                self.attention_residual_scale * x + attention_out
+            )
+
+        out = self.ffn_post_norm(
+            self.ffn_residual_scale * h + self.feed_forward(self.ffn_norm(h))
+        )
         return out
 
 
