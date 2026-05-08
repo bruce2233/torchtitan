@@ -178,6 +178,17 @@ def llama3_nanogpt_smoke() -> Trainer.Config:
     )
 
 
+def llama3_nanogpt_smoke_fineweb_edu_text() -> Trainer.Config:
+    """NanoGPT smoke config using FineWeb-Edu parquet with online tokenization."""
+    config = llama3_nanogpt_smoke()
+    config.dump_folder = "./outputs/nanogpt_smoke_fineweb_edu_text"
+    config.dataloader = HuggingFaceTextDataLoader.Config(
+        dataset="fineweb_edu",
+        infinite=True,
+    )
+    return config
+
+
 def llama3_nanogpt_contrastive_ntp() -> Trainer.Config:
     """Batch-local contrastive NTP on modded-nanogpt FineWeb token shards."""
     return Trainer.Config(

@@ -33,6 +33,29 @@ def _process_c4_text(sample: dict[str, Any]) -> str:
     return sample["text"]
 
 
+def _load_fineweb_edu_dataset(dataset_path: str, split: str):
+    """Load the FineWeb-Edu 10BT sample from HF Hub or local parquet shards."""
+    if dataset_path.endswith(".parquet") or ".parquet" in dataset_path:
+        return load_dataset(
+            "parquet",
+            data_files=dataset_path,
+            split=split,
+            streaming=True,
+        )
+
+    return load_dataset(
+        dataset_path,
+        name="sample-10BT",
+        split=split,
+        streaming=True,
+    )
+
+
+def _process_fineweb_edu_text(sample: dict[str, Any]) -> str:
+    """Process FineWeb-Edu sample text."""
+    return sample["text"]
+
+
 # Add your dataset here - more information at docs/datasets.md
 DATASETS = {
     "c4": DatasetConfig(
@@ -49,6 +72,11 @@ DATASETS = {
         path="allenai/c4",
         loader=partial(_load_c4_dataset, split="validation"),
         sample_processor=_process_c4_text,
+    ),
+    "fineweb_edu": DatasetConfig(
+        path="HuggingFaceFW/fineweb-edu",
+        loader=partial(_load_fineweb_edu_dataset, split="train"),
+        sample_processor=_process_fineweb_edu_text,
     ),
 }
 
