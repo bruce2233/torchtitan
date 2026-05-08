@@ -126,21 +126,34 @@ def _build_llama3_keel_layers(
     fuse_qkv: bool = False,
     attn_backend: str,
     residual_scale: float | None = None,
+    block_loop_count: int = 1,
 ) -> list[TransformerBlock.Config]:
     """Build KEEL layers. ``n_layers`` is Transformer blocks, so sub-layers = 2x."""
     inner_attention, mask_type = get_attention_config(attn_backend)
-    alpha = float(residual_scale if residual_scale is not None else 2 * n_layers)
+    alpha = float(
+        residual_scale
+        if residual_scale is not None
+        else 2 * n_layers * block_loop_count
+    )
     layers = []
     for layer_id in range(n_layers):
         is_first_block = layer_id == 0
+        use_runtime_first_block_rule = is_first_block and block_loop_count > 1
+        residual_scale_for_block = (
+            1.0 if is_first_block and not use_runtime_first_block_rule else alpha
+        )
         layers.append(
             Llama3KeelTransformerBlock.Config(
                 attention_norm=_norm_config(dim),
                 ffn_norm=_norm_config(dim),
-                attention_post_norm=None if is_first_block else _norm_config(dim),
+                attention_post_norm=(
+                    None
+                    if is_first_block and not use_runtime_first_block_rule
+                    else _norm_config(dim)
+                ),
                 ffn_post_norm=_norm_config(dim),
-                attention_residual_scale=1.0 if is_first_block else alpha,
-                ffn_residual_scale=1.0 if is_first_block else alpha,
+                attention_residual_scale=residual_scale_for_block,
+                ffn_residual_scale=residual_scale_for_block,
                 attention=make_gqa_config(
                     dim=dim,
                     n_heads=n_heads,
@@ -264,16 +277,21 @@ def _nanogpt_smoke_model(
     dim: int = 768,
     n_heads: int = 12,
     use_keel: bool = False,
+    block_loop_count: int = 1,
 ) -> Llama3Model.Config:
     # modded-nanogpt uses GPT-2 tokens with 50,257 ids padded to 50,304.
     # Use GPT-2-style tied input/output embeddings. Without tying, the padded
     # 50k vocab adds vocab_size * dim parameters.
     vocab_size = 50304
     build_layers = _build_llama3_keel_layers if use_keel else _build_llama3_layers
+    layer_kwargs = {}
+    if use_keel:
+        layer_kwargs["block_loop_count"] = block_loop_count
     return Llama3Model.Config(
         dim=dim,
         vocab_size=vocab_size,
         enable_weight_tying=True,
+        block_loop_count=block_loop_count,
         tok_embeddings=Embedding.Config(
             num_embeddings=vocab_size,
             embedding_dim=dim,
@@ -298,6 +316,7 @@ def _nanogpt_smoke_model(
             n_heads=n_heads,
             hidden_dim=compute_ffn_hidden_dim(dim, multiple_of=256),
             attn_backend=attn_backend,
+            **layer_kwargs,
         ),
     )
 
@@ -325,6 +344,39 @@ def _keel_gpt2_smoke(attn_backend: str) -> Llama3Model.Config:
 def _keel_gpt2_512x256(attn_backend: str) -> Llama3Model.Config:
     return _nanogpt_smoke_model(
         attn_backend, n_layers=256, dim=512, n_heads=8, use_keel=True
+    )
+
+
+def _keel_gpt2_looped_512x128x2(attn_backend: str) -> Llama3Model.Config:
+    return _nanogpt_smoke_model(
+        attn_backend,
+        n_layers=128,
+        dim=512,
+        n_heads=8,
+        use_keel=True,
+        block_loop_count=2,
+    )
+
+
+def _keel_gpt2_looped_512x16x16(attn_backend: str) -> Llama3Model.Config:
+    return _nanogpt_smoke_model(
+        attn_backend,
+        n_layers=16,
+        dim=512,
+        n_heads=8,
+        use_keel=True,
+        block_loop_count=16,
+    )
+
+
+def _keel_gpt2_looped_768x32x16(attn_backend: str) -> Llama3Model.Config:
+    return _nanogpt_smoke_model(
+        attn_backend,
+        n_layers=32,
+        dim=768,
+        n_heads=12,
+        use_keel=True,
+        block_loop_count=16,
     )
 
 
@@ -635,6 +687,9 @@ llama3_configs = {
     "nanogpt_smoke_384x192": _nanogpt_smoke_384x192,
     "keel_gpt2_smoke": _keel_gpt2_smoke,
     "keel_gpt2_512x256": _keel_gpt2_512x256,
+    "keel_gpt2_looped_512x128x2": _keel_gpt2_looped_512x128x2,
+    "keel_gpt2_looped_512x16x16": _keel_gpt2_looped_512x16x16,
+    "keel_gpt2_looped_768x32x16": _keel_gpt2_looped_768x32x16,
     "keel_64x1024": _keel_64x1024,
     "keel_256x1024": _keel_256x1024,
     "keel_512x1024": _keel_512x1024,

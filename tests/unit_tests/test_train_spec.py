@@ -13,9 +13,13 @@ from torchtitan.components.optimizer import OptimizersContainer
 from torchtitan.distributed.parallel_dims import ParallelDims
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.llama3 import model_registry, parallelize_llama
-from torchtitan.models.llama3.model import Llama3KeelTransformerBlock
+from torchtitan.models.llama3.model import (
+    Llama3KeelTransformerBlock,
+    Llama3Model,
+)
 from torchtitan.protocols import BaseModel
 from torchtitan.protocols.model_spec import ModelSpec
+from torchtitan.protocols.module import ModuleDict
 
 
 class FakeModel(BaseModel):
@@ -92,6 +96,82 @@ class TestModelSpec:
         assert first_layer.attention_post_norm is None
         assert last_layer.attention_residual_scale == 512.0
         assert last_layer.ffn_residual_scale == 512.0
+
+    def test_looped_keel_model_registry(self):
+        spec = model_registry("keel_gpt2_looped_512x128x2")
+        assert spec.model.block_loop_count == 2
+        assert len(spec.model.layers) == 128
+        assert spec.model.dim == 512
+
+        first_layer = spec.model.layers[0]
+        last_layer = spec.model.layers[-1]
+        assert isinstance(first_layer, Llama3KeelTransformerBlock.Config)
+        assert first_layer.attention_post_norm is not None
+        assert first_layer.attention_residual_scale == 512.0
+        assert first_layer.ffn_residual_scale == 512.0
+        assert last_layer.attention_residual_scale == 512.0
+        assert last_layer.ffn_residual_scale == 512.0
+
+    def test_looped_keel_16x16_model_registry(self):
+        spec = model_registry("keel_gpt2_looped_512x16x16")
+        assert spec.model.block_loop_count == 16
+        assert len(spec.model.layers) == 16
+        assert spec.model.dim == 512
+
+        first_layer = spec.model.layers[0]
+        last_layer = spec.model.layers[-1]
+        assert isinstance(first_layer, Llama3KeelTransformerBlock.Config)
+        assert first_layer.attention_post_norm is not None
+        assert first_layer.attention_residual_scale == 512.0
+        assert first_layer.ffn_residual_scale == 512.0
+        assert last_layer.attention_residual_scale == 512.0
+        assert last_layer.ffn_residual_scale == 512.0
+
+    def test_looped_keel_768x32x16_model_registry(self):
+        spec = model_registry("keel_gpt2_looped_768x32x16")
+        assert spec.model.block_loop_count == 16
+        assert len(spec.model.layers) == 32
+        assert spec.model.dim == 768
+
+        first_layer = spec.model.layers[0]
+        last_layer = spec.model.layers[-1]
+        assert isinstance(first_layer, Llama3KeelTransformerBlock.Config)
+        assert first_layer.attention_post_norm is not None
+        assert first_layer.attention_residual_scale == 1024.0
+        assert first_layer.ffn_residual_scale == 1024.0
+        assert last_layer.attention_residual_scale == 1024.0
+        assert last_layer.ffn_residual_scale == 1024.0
+
+    def test_looped_keel_first_logical_block_override(self):
+        class RecordingKeelBlock(Llama3KeelTransformerBlock):
+            def __init__(self):
+                nn.Module.__init__(self)
+                self.calls = []
+
+            def forward(
+                self,
+                x,
+                freqs_cis,
+                attention_masks,
+                positions=None,
+                *,
+                is_first_logical_block=None,
+            ):
+                self.calls.append(is_first_logical_block)
+                return x
+
+        model = model_registry("keel_debugmodel").model.build()
+        assert isinstance(model, Llama3Model)
+        first_block = RecordingKeelBlock()
+        second_block = RecordingKeelBlock()
+        model.layers = ModuleDict({"0": first_block, "1": second_block})
+        model.block_loop_count = 2
+        model._skip_lm_head = True
+
+        model(torch.zeros((1, 4), dtype=torch.long))
+
+        assert first_block.calls == [True, False]
+        assert second_block.calls == [False, False]
 
     def test_model_spec_creation(self):
         fake_config = FakeModel.Config()

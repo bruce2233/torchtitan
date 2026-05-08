@@ -96,19 +96,30 @@ class Llama3KeelTransformerBlock(TransformerBlock):
         freqs_cis: torch.Tensor,
         attention_masks: AttentionMasksType | None,
         positions: torch.Tensor | None = None,
+        *,
+        is_first_logical_block: bool | None = None,
     ):
         attention_out = self.attention(
             self.attention_norm(x), freqs_cis, attention_masks, positions
         )
-        if self.attention_post_norm is None:
+        is_first_attention = (
+            self.attention_post_norm is None
+            if is_first_logical_block is None
+            else is_first_logical_block
+        )
+        if is_first_attention:
             h = x + attention_out
         else:
+            assert self.attention_post_norm is not None
             h = self.attention_post_norm(
                 self.attention_residual_scale * x + attention_out
             )
 
+        ffn_residual_scale = (
+            1.0 if is_first_logical_block else self.ffn_residual_scale
+        )
         out = self.ffn_post_norm(
-            self.ffn_residual_scale * h + self.feed_forward(self.ffn_norm(h))
+            ffn_residual_scale * h + self.feed_forward(self.ffn_norm(h))
         )
         return out
 
@@ -126,6 +137,7 @@ class Llama3Model(Decoder):
         dim: int = 4096
         vocab_size: int = 128256
         enable_weight_tying: bool = False
+        block_loop_count: int = 1
 
         def update_from_config(
             self,
@@ -136,6 +148,10 @@ class Llama3Model(Decoder):
             training = trainer_config.training
             parallelism = trainer_config.parallelism
             seq_len = training.seq_len
+            if self.block_loop_count < 1:
+                raise ValueError(
+                    f"block_loop_count must be positive, got {self.block_loop_count}."
+                )
             if seq_len > self.rope.max_seq_len:
                 logger.warning(
                     f"Sequence length {seq_len} exceeds original maximum {self.rope.max_seq_len}."
@@ -180,9 +196,36 @@ class Llama3Model(Decoder):
         def get_nparams_and_flops(
             self, model: nn.Module, seq_len: int
         ) -> tuple[int, int]:
+            if self.block_loop_count > 1:
+                nparams = sum(p.numel() for p in model.parameters())
+                nparams_embedding = sum(
+                    sum(p.numel() for p in m.parameters())
+                    for m in model.children()
+                    if isinstance(m, nn.Embedding)
+                )
+                nparams_layers = sum(p.numel() for p in model.layers.parameters())
+                nparams_non_layer_for_flops = nparams - nparams_layers
+                if not self.enable_weight_tying:
+                    nparams_non_layer_for_flops -= nparams_embedding
+
+                logical_layers = len(self.layers) * self.block_loop_count
+                nparams_for_flops = (
+                    nparams_non_layer_for_flops
+                    + nparams_layers * self.block_loop_count
+                )
+                num_flops_per_token = (
+                    6 * nparams_for_flops
+                    + 6
+                    * logical_layers
+                    * self.layers[0].attention.n_heads
+                    * (2 * (self.dim // self.layers[0].attention.n_heads))
+                    * seq_len
+                )
+                return nparams, num_flops_per_token
+
             return get_dense_model_nparams_and_flops(
                 model,
-                n_layers=len(self.layers),
+                n_layers=len(self.layers) * self.block_loop_count,
                 n_heads=self.layers[0].attention.n_heads,
                 head_dims=2 * (self.dim // self.layers[0].attention.n_heads),
                 seq_len=seq_len,
@@ -192,9 +235,50 @@ class Llama3Model(Decoder):
     def __init__(self, config: Config):
         super().__init__(config)
         self.enable_weight_tying = config.enable_weight_tying
+        self.block_loop_count = config.block_loop_count
 
         if self.enable_weight_tying:
             self.tok_embeddings.weight = self.lm_head.weight
+
+    @staticmethod
+    def _is_keel_layer(layer: nn.Module) -> bool:
+        wrapped_layer = getattr(layer, "_checkpoint_wrapped_module", layer)
+        return isinstance(wrapped_layer, Llama3KeelTransformerBlock)
+
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        attention_masks: AttentionMasksType | None = None,
+        positions: torch.Tensor | None = None,
+    ):
+        # Passthrough for nonexistent layers enables pipeline-parallel stages.
+        h = self.tok_embeddings(tokens) if self.tok_embeddings is not None else tokens
+
+        for sequential_layer_id, (layer_name, layer) in enumerate(self.layers.items()):
+            physical_layer_id = (
+                int(layer_name) if layer_name.isdigit() else sequential_layer_id
+            )
+            for loop_idx in range(self.block_loop_count):
+                is_first_logical_block = (
+                    physical_layer_id == 0 and loop_idx == 0
+                )
+                if self._is_keel_layer(layer):
+                    h = layer(
+                        h,
+                        self.freqs_cis,
+                        attention_masks,
+                        positions,
+                        is_first_logical_block=is_first_logical_block,
+                    )
+                else:
+                    h = layer(h, self.freqs_cis, attention_masks, positions)
+
+        h = self.norm(h) if self.norm is not None else h
+
+        if self._skip_lm_head:
+            return h
+        output = self.lm_head(h) if self.lm_head is not None else h
+        return output
 
     def init_states(
         self,

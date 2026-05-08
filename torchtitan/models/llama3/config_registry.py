@@ -250,6 +250,49 @@ def llama3_keel_gpt2_512x256_fineweb_edu_text() -> Trainer.Config:
     return config
 
 
+def llama3_keel_gpt2_looped_512x128x2_fineweb_edu_text() -> Trainer.Config:
+    """Looped KEEL GPT-2 config: 128 physical blocks x 2 loops = 256 logical blocks."""
+    config = llama3_keel_gpt2_512x256_fineweb_edu_text()
+    config.dump_folder = "./outputs/keel_gpt2_looped_512x128x2_fineweb_edu_500"
+    config.model_spec = model_registry("keel_gpt2_looped_512x128x2")
+    config.training = TrainingConfig(
+        local_batch_size=1,
+        global_batch_size=1,
+        seq_len=4096,
+        steps=500,
+        dtype="bfloat16",
+        gc_freq=50,
+    )
+    config.metrics = MetricsProcessor.Config(log_freq=5)
+    config.checkpoint = CheckpointManager.Config(
+        enable=True,
+        interval=500,
+        last_save_model_only=False,
+        keep_latest_k=2,
+    )
+    config.activation_checkpoint = ActivationCheckpointConfig(mode="full")
+    return config
+
+
+def llama3_keel_gpt2_looped_512x16x16_fineweb_edu_text() -> Trainer.Config:
+    """Looped KEEL GPT-2 config: 16 physical blocks x 16 loops = 256 logical blocks."""
+    config = llama3_keel_gpt2_looped_512x128x2_fineweb_edu_text()
+    config.dump_folder = "./outputs/keel_gpt2_looped_512x16x16_fineweb_edu_500"
+    config.model_spec = model_registry("keel_gpt2_looped_512x16x16")
+    return config
+
+
+def llama3_keel_gpt2_looped_768x32x16_fineweb_edu_text() -> Trainer.Config:
+    """Looped KEEL GPT-2 config: 32 physical blocks x 16 loops = 512 logical blocks."""
+    config = llama3_keel_gpt2_looped_512x128x2_fineweb_edu_text()
+    config.dump_folder = "./outputs/keel_gpt2_looped_768x32x16_fineweb_edu_1000"
+    config.model_spec = model_registry("keel_gpt2_looped_768x32x16")
+    config.training.steps = 1000
+    config.metrics = MetricsProcessor.Config(log_freq=1)
+    config.checkpoint.interval = 1000
+    return config
+
+
 def llama3_nanogpt_smoke_24layer() -> Trainer.Config:
     """FineWeb smoke config with twice the GPT-2-small layer count."""
     config = llama3_nanogpt_smoke()
