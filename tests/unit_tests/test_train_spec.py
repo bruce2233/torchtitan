@@ -9,10 +9,17 @@ from functools import partial
 
 import torch
 import torch.nn as nn
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
+from torchtitan.config import ActivationCheckpointConfig
+from torchtitan.distributed.activation_checkpoint import apply_ac
 from torchtitan.components.optimizer import OptimizersContainer
 from torchtitan.distributed.parallel_dims import ParallelDims
 from torchtitan.models.common.linear import Linear
-from torchtitan.models.llama3 import model_registry, parallelize_llama
+from torchtitan.models.llama3 import (
+    _nanogpt_smoke_model,
+    model_registry,
+    parallelize_llama,
+)
 from torchtitan.models.llama3.model import (
     Llama3KeelTransformerBlock,
     Llama3Model,
@@ -172,6 +179,87 @@ class TestModelSpec:
 
         assert first_block.calls == [True, False]
         assert second_block.calls == [False, False]
+
+    def test_looped_keel_first_logical_block_with_activation_checkpointing(self):
+        class RecordingKeelBlock(Llama3KeelTransformerBlock):
+            def __init__(self):
+                nn.Module.__init__(self)
+                self.calls = []
+
+            def forward(
+                self,
+                x,
+                freqs_cis,
+                attention_masks,
+                positions=None,
+                *,
+                is_first_logical_block=None,
+            ):
+                self.calls.append(is_first_logical_block)
+                return x
+
+        model = model_registry("keel_debugmodel").model.build()
+        assert isinstance(model, Llama3Model)
+        first_block = RecordingKeelBlock()
+        second_block = RecordingKeelBlock()
+        model.layers = ModuleDict(
+            {
+                "0": checkpoint_wrapper(first_block),
+                "1": checkpoint_wrapper(second_block),
+            }
+        )
+        model.block_loop_count = 2
+        model._skip_lm_head = True
+
+        model(torch.zeros((1, 4), dtype=torch.long))
+
+        assert model._is_keel_layer(model.layers["0"])
+        assert first_block.calls == [True, False]
+        assert second_block.calls == [False, False]
+
+    def test_looped_keel_full_ac_matches_eager_gradients(self):
+        torch.manual_seed(123)
+        config = _nanogpt_smoke_model(
+            "sdpa",
+            n_layers=2,
+            dim=64,
+            n_heads=4,
+            use_keel=True,
+            block_loop_count=2,
+        )
+        base_model = config.build()
+        base_model.init_weights()
+
+        checkpointed_model = config.build()
+        checkpointed_model.load_state_dict(base_model.state_dict())
+        apply_ac(
+            checkpointed_model,
+            ActivationCheckpointConfig(mode="full"),
+        )
+
+        base_model._skip_lm_head = True
+        checkpointed_model._skip_lm_head = True
+        tokens = torch.randint(0, 128, (2, 8), dtype=torch.long)
+
+        base_out = base_model(tokens)
+        checkpointed_out = checkpointed_model(tokens)
+        assert torch.equal(base_out, checkpointed_out)
+
+        target = torch.randn_like(base_out)
+        base_loss = torch.nn.functional.mse_loss(base_out, target)
+        checkpointed_loss = torch.nn.functional.mse_loss(checkpointed_out, target)
+        base_loss.backward()
+        checkpointed_loss.backward()
+
+        assert torch.equal(base_loss, checkpointed_loss)
+        for base_param, checkpointed_param in zip(
+            base_model.parameters(), checkpointed_model.parameters()
+        ):
+            if base_param.grad is None and checkpointed_param.grad is None:
+                continue
+            assert base_param.grad is not None
+            assert checkpointed_param.grad is not None
+            assert torch.equal(base_param.grad, checkpointed_param.grad)
 
     def test_model_spec_creation(self):
         fake_config = FakeModel.Config()
