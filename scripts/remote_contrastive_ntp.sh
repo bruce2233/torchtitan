@@ -33,11 +33,10 @@ LOG_FREQ="${LOG_FREQ:-50}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-1}"
 LOSS_DIRECTION="${LOSS_DIRECTION:-bidirectional}"
 
-OPTIMIZER_NAME="${OPTIMIZER_NAME:-MuonAdamW}"
+OPTIMIZER_NAME="${OPTIMIZER_NAME:-Muon}"
 LR="${LR:-3e-4}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-0.1}"
 OPTIMIZER_IMPL="${OPTIMIZER_IMPL:-fused}"
-MUON_LR="${MUON_LR:-0.02}"
 
 CHECKPOINT_ENABLE="${CHECKPOINT_ENABLE:-1}"
 CHECKPOINT_INTERVAL="${CHECKPOINT_INTERVAL:-3000}"
@@ -70,7 +69,7 @@ Common overrides:
   NPROC_PER_NODE=4                     pure DP multi-GPU launch
   SEQ_LEN=20000 STEPS=50000
   LOSS_DIRECTION=h2t                   h2t, t2c, or bidirectional
-  OPTIMIZER_NAME=AdamW                 use AdamW instead of MuonAdamW
+  OPTIMIZER_NAME=AdamW                 use AdamW instead of Muon
   BACKGROUND=0                         foreground training
 EOF
 }
@@ -246,10 +245,6 @@ start_train() {
     --optimizer.weight_decay "${WEIGHT_DECAY}"
     --optimizer.implementation "${OPTIMIZER_IMPL}"
   )
-  if [[ "${OPTIMIZER_NAME}" == "MuonAdamW" ]]; then
-    optimizer_args+=(--optimizer.muon_lr "${MUON_LR}")
-  fi
-
   local checkpoint_args=(--checkpoint.no-enable)
   if [[ "${CHECKPOINT_ENABLE}" == "1" ]]; then
     checkpoint_args=(

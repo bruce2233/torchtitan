@@ -135,7 +135,7 @@ Default training is:
 - `seq_len=20000`
 - `local_batch_size=1`
 - non-FP8 `bfloat16` training
-- `MuonAdamW`
+- `Muon`
 - checkpoint every 3000 steps, keep latest 2
 
 Start in the background:

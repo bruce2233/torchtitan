@@ -360,7 +360,7 @@ def llama3_nanogpt_contrastive_ntp() -> Trainer.Config:
 
 
 def llama3_nanogpt_contrastive_ntp_fp8_muon() -> Trainer.Config:
-    """Contrastive NanoGPT run with FP8 transformer linears and MuonAdamW."""
+    """Contrastive NanoGPT run with FP8 transformer linears and Muon."""
     config = llama3_nanogpt_contrastive_ntp()
     model_compile_enabled = (
         config.compile.enable and "model" in config.compile.components
@@ -376,9 +376,8 @@ def llama3_nanogpt_contrastive_ntp_fp8_muon() -> Trainer.Config:
         ],
     )
     config.optimizer = OptimizersContainer.Config(
-        name="MuonAdamW",
+        name="Muon",
         lr=3e-4,
-        muon_lr=0.02,
         weight_decay=0.1,
         muon_momentum=0.95,
         muon_nesterov=True,
