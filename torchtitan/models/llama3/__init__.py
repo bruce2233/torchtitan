@@ -380,6 +380,28 @@ def _keel_gpt2_looped_768x32x16(attn_backend: str) -> Llama3Model.Config:
     )
 
 
+def _keel_gpt2_looped_768x2x32(attn_backend: str) -> Llama3Model.Config:
+    return _nanogpt_smoke_model(
+        attn_backend,
+        n_layers=2,
+        dim=768,
+        n_heads=12,
+        use_keel=True,
+        block_loop_count=32,
+    )
+
+
+def _keel_gpt2_looped_768x8x8(attn_backend: str) -> Llama3Model.Config:
+    return _nanogpt_smoke_model(
+        attn_backend,
+        n_layers=8,
+        dim=768,
+        n_heads=12,
+        use_keel=True,
+        block_loop_count=8,
+    )
+
+
 def _paper_depth_model(
     attn_backend: str,
     *,
@@ -690,6 +712,8 @@ llama3_configs = {
     "keel_gpt2_looped_512x128x2": _keel_gpt2_looped_512x128x2,
     "keel_gpt2_looped_512x16x16": _keel_gpt2_looped_512x16x16,
     "keel_gpt2_looped_768x32x16": _keel_gpt2_looped_768x32x16,
+    "keel_gpt2_looped_768x2x32": _keel_gpt2_looped_768x2x32,
+    "keel_gpt2_looped_768x8x8": _keel_gpt2_looped_768x8x8,
     "keel_64x1024": _keel_64x1024,
     "keel_256x1024": _keel_256x1024,
     "keel_512x1024": _keel_512x1024,

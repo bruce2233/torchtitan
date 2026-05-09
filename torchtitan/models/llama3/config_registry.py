@@ -293,6 +293,90 @@ def llama3_keel_gpt2_looped_768x32x16_fineweb_edu_text() -> Trainer.Config:
     return config
 
 
+def llama3_keel_gpt2_looped_768x2x32_tiny_overfit() -> Trainer.Config:
+    """Tiny overfit run: 2 physical blocks x 32 loops = 64 logical blocks."""
+    config = llama3_keel_gpt2_looped_512x128x2_fineweb_edu_text()
+    config.dump_folder = "./outputs/keel_gpt2_looped_768x2x32_tiny_overfit_200"
+    config.model_spec = model_registry("keel_gpt2_looped_768x2x32")
+    config.dataloader = HuggingFaceTextDataLoader.Config(
+        dataset="c4_test",
+        dataset_path="./outputs/tiny_c4_overfit",
+        infinite=True,
+    )
+    config.training = TrainingConfig(
+        local_batch_size=1,
+        global_batch_size=1,
+        seq_len=256,
+        steps=200,
+        dtype="bfloat16",
+        gc_freq=50,
+    )
+    config.optimizer = OptimizersContainer.Config(
+        lr=3e-4,
+        weight_decay=0.1,
+    )
+    config.metrics = MetricsProcessor.Config(log_freq=1)
+    config.checkpoint = CheckpointManager.Config(
+        enable=True,
+        interval=200,
+        last_save_model_only=False,
+        keep_latest_k=2,
+    )
+    config.activation_checkpoint = ActivationCheckpointConfig(mode="none")
+    return config
+
+
+def llama3_keel_gpt2_looped_768x2x32_fineweb_edu_text() -> Trainer.Config:
+    """Looped KEEL GPT-2 config: 2 physical blocks x 32 loops = 64 logical blocks."""
+    config = llama3_keel_gpt2_looped_512x128x2_fineweb_edu_text()
+    config.dump_folder = "./outputs/keel_gpt2_looped_768x2x32_fineweb_edu_10000"
+    config.model_spec = model_registry("keel_gpt2_looped_768x2x32")
+    config.training = TrainingConfig(
+        local_batch_size=1,
+        global_batch_size=1,
+        seq_len=4096,
+        steps=10000,
+        dtype="bfloat16",
+        gc_freq=50,
+    )
+    config.metrics = MetricsProcessor.Config(log_freq=1)
+    config.checkpoint = CheckpointManager.Config(
+        enable=True,
+        interval=1000,
+        last_save_model_only=False,
+        keep_latest_k=2,
+    )
+    config.activation_checkpoint = ActivationCheckpointConfig(mode="full")
+    return config
+
+
+def llama3_keel_gpt2_looped_768x8x8_fineweb_edu_text() -> Trainer.Config:
+    """Looped KEEL GPT-2 config: 8 physical blocks x 8 loops = 64 logical blocks."""
+    config = llama3_keel_gpt2_looped_768x2x32_fineweb_edu_text()
+    config.dump_folder = "./outputs/keel_gpt2_looped_768x8x8_fineweb_edu_10000"
+    config.model_spec = model_registry("keel_gpt2_looped_768x8x8")
+    return config
+
+
+def llama3_keel_gpt2_looped_768x8x8_fineweb_edu_text_float8() -> Trainer.Config:
+    """8x8 looped KEEL config with torchao FP8 linear layers."""
+    config = llama3_keel_gpt2_looped_768x8x8_fineweb_edu_text()
+    model_compile_enabled = (
+        config.compile.enable and "model" in config.compile.components
+    )
+    config.dump_folder = "./outputs/keel_gpt2_looped_768x8x8_fineweb_edu_10000_fp8"
+    config.model_spec = model_registry(
+        "keel_gpt2_looped_768x8x8",
+        quantization=[
+            Float8LinearConverter.Config(
+                filter_fqns=["lm_head", "output"],
+                model_compile_enabled=model_compile_enabled,
+            ),
+        ],
+    )
+    return config
+
+
 def llama3_nanogpt_smoke_24layer() -> Trainer.Config:
     """FineWeb smoke config with twice the GPT-2-small layer count."""
     config = llama3_nanogpt_smoke()
