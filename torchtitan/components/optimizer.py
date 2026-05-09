@@ -108,6 +108,35 @@ class OptimizersContainer(Optimizer, Stateful, Configurable, Generic[T]):
         weight_decay: float = 0.1
         """Weight decay to use"""
 
+        muon_momentum: float = 0.95
+        """Momentum factor for Muon."""
+
+        muon_nesterov: bool = True
+        """Whether to use Nesterov momentum for Muon."""
+
+        muon_ns_steps: int = 5
+        """Number of Newton-Schulz iterations for Muon."""
+
+        muon_ns_coefficients: tuple[float, float, float] = (3.4445, -4.775, 2.0315)
+        """Newton-Schulz polynomial coefficients for Muon."""
+
+        muon_eps: float = 1e-7
+        """Numerical epsilon for Muon."""
+
+        muon_adjust_lr_fn: Literal["original", "match_rms_adamw"] | None = (
+            "match_rms_adamw"
+        )
+        """Muon learning-rate adjustment. 'match_rms_adamw' reuses AdamW-tuned LR."""
+
+        muon_param_pattern: str | None = None
+        """Optional regex selecting Muon parameters. Only matching 2D params use Muon."""
+
+        muon_exclude_param_pattern: str = (
+            r"(^|\.)(tok_embeddings|embed_tokens|embedding|embeddings|"
+            r"lm_head|output)(\.|$)"
+        )
+        """Regex excluding 2D parameters from Muon when muon_param_pattern is unset."""
+
         implementation: Literal[
             "for-loop", "foreach", "fused", "fused_opt_states_bf16"
         ] = "fused"
@@ -119,8 +148,9 @@ class OptimizersContainer(Optimizer, Stateful, Configurable, Generic[T]):
         - 'fused_opt_states_bf16': Like 'fused', but initialize Adam/AdamW
           momentum and variance in bfloat16 via a step pre-hook so the fused
           CUDA kernel uses its mixed-precision path (fp32 params + bf16 states).
-          Only supported for Adam/AdamW with OptimizersContainer (not
-          OptimizersInBackwardContainer). See docs/bf16_optimizer_states.md.
+          Only supported for Adam/AdamW optimizer states, including the AdamW
+          fallback groups when name='Muon'. Not supported with
+          OptimizersInBackwardContainer. See docs/bf16_optimizer_states.md.
         - more info: https://pytorch.org/docs/stable/optim.html
         """
 
@@ -132,24 +162,37 @@ class OptimizersContainer(Optimizer, Stateful, Configurable, Generic[T]):
 
         def __post_init__(self):
             if self.implementation == "fused_opt_states_bf16":
-                if self.name not in ("Adam", "AdamW"):
+                if self.name not in ("Adam", "AdamW", "Muon"):
                     raise ValueError(
                         "implementation='fused_opt_states_bf16' is only supported "
-                        f"for Adam/AdamW, got optimizer '{self.name}'"
+                        f"for Adam/AdamW states, got optimizer '{self.name}'"
                     )
 
     optimizers: list[T]
+    optimizers_by_model_part: list[list[T]]
     model_parts: list[nn.Module]
 
     @staticmethod
     def _resolve_optimizer_cls(name: str) -> type:
-        optimizer_classes = {"Adam": torch.optim.Adam, "AdamW": torch.optim.AdamW}
+        optimizer_classes = {
+            "Adam": torch.optim.Adam,
+            "AdamW": torch.optim.AdamW,
+            "Muon": getattr(torch.optim, "Muon", None),
+        }
         if name not in optimizer_classes:
             raise NotImplementedError(f"Optimizer {name} not added.")
+        if optimizer_classes[name] is None:
+            raise NotImplementedError(
+                "Optimizer Muon is not available in this PyTorch build."
+            )
         return optimizer_classes[name]
 
     @staticmethod
     def _build_optimizer_kwargs(config: Config) -> dict[str, Any]:
+        return OptimizersContainer._build_adam_optimizer_kwargs(config)
+
+    @staticmethod
+    def _build_adam_optimizer_kwargs(config: Config) -> dict[str, Any]:
         assert config.implementation in [
             "fused",
             "foreach",
@@ -167,10 +210,25 @@ class OptimizersContainer(Optimizer, Stateful, Configurable, Generic[T]):
         }
 
     @staticmethod
-    def _build_param_groups(
-        model: nn.Module,
+    def _build_muon_optimizer_kwargs(config: Config) -> dict[str, Any]:
+        return {
+            "lr": config.lr,
+            "weight_decay": config.weight_decay,
+            "momentum": config.muon_momentum,
+            "nesterov": config.muon_nesterov,
+            "ns_coefficients": config.muon_ns_coefficients,
+            "eps": config.muon_eps,
+            "ns_steps": config.muon_ns_steps,
+            "adjust_lr_fn": config.muon_adjust_lr_fn,
+        }
+
+    @staticmethod
+    def _build_param_groups_from_named_parameters(
+        named_parameters: list[tuple[str, nn.Parameter]],
         config: Config,
         default_kwargs: dict[str, Any],
+        *,
+        warn_on_zero_matches: bool = True,
     ) -> list[dict[str, Any]]:
         """Build PyTorch param groups from model parameters and config.
 
@@ -178,18 +236,20 @@ class OptimizersContainer(Optimizer, Stateful, Configurable, Generic[T]):
         or to the default group if no pattern matches. Returns a list of dicts
         with "params" key and optimizer kwargs, suitable for passing to an optimizer.
         """
+        named_parameters = [
+            (name, param) for name, param in named_parameters if param.requires_grad
+        ]
+
         if not config.param_groups:
-            params = [p for p in model.parameters() if p.requires_grad]
-            return [{"params": params, **default_kwargs}]
+            params = [p for _, p in named_parameters]
+            return [{"params": params, **default_kwargs}] if params else []
 
         compiled_patterns = [re.compile(pg.pattern) for pg in config.param_groups]
 
         # group_index -> list of params; None means default group
         grouped_params: dict[int | None, list[nn.Parameter]] = defaultdict(list)
 
-        for name, param in model.named_parameters():
-            if not param.requires_grad:
-                continue
+        for name, param in named_parameters:
             matched_index = None
             for i, pat in enumerate(compiled_patterns):
                 if pat.search(name):
@@ -199,7 +259,7 @@ class OptimizersContainer(Optimizer, Stateful, Configurable, Generic[T]):
 
         # Warn for patterns that matched nothing
         for i, pg in enumerate(config.param_groups):
-            if i not in grouped_params:
+            if warn_on_zero_matches and i not in grouped_params:
                 logger.warning(
                     f"Optimizer param_groups pattern '{pg.pattern}' "
                     f"matched no parameters"
@@ -219,7 +279,9 @@ class OptimizersContainer(Optimizer, Stateful, Configurable, Generic[T]):
             group_kwargs["weight_decay"] = (
                 default_kwargs["weight_decay"] * pg.weight_decay_multiplier
             )
-            if pg.beta1 is not None or pg.beta2 is not None:
+            if (pg.beta1 is not None or pg.beta2 is not None) and (
+                "betas" in default_kwargs
+            ):
                 default_beta1, default_beta2 = default_kwargs["betas"]
                 group_kwargs["betas"] = (
                     pg.beta1 if pg.beta1 is not None else default_beta1,
@@ -229,20 +291,140 @@ class OptimizersContainer(Optimizer, Stateful, Configurable, Generic[T]):
 
         return result
 
+    @staticmethod
+    def _build_param_groups(
+        model: nn.Module,
+        config: Config,
+        default_kwargs: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        return OptimizersContainer._build_param_groups_from_named_parameters(
+            list(model.named_parameters()),
+            config,
+            default_kwargs,
+        )
+
+    @staticmethod
+    def _split_muon_named_parameters(
+        model: nn.Module, config: Config
+    ) -> tuple[list[tuple[str, nn.Parameter]], list[tuple[str, nn.Parameter]]]:
+        """Split trainable params into Muon and AdamW fallback groups.
+
+        Muon is only valid for 2D hidden-layer parameters. By default we send 2D
+        tensors to Muon while keeping embeddings, lm heads/output layers, bias,
+        and normalization parameters on AdamW. Users can narrow Muon selection
+        further with ``muon_param_pattern``.
+        """
+        muon_param_pattern = (
+            re.compile(config.muon_param_pattern)
+            if config.muon_param_pattern is not None
+            else None
+        )
+        muon_exclude_param_pattern = (
+            re.compile(config.muon_exclude_param_pattern, re.IGNORECASE)
+            if config.muon_exclude_param_pattern
+            else None
+        )
+
+        muon_named_parameters = []
+        adam_named_parameters = []
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+
+            use_muon = param.ndim == 2
+            if muon_param_pattern is not None:
+                use_muon = use_muon and bool(muon_param_pattern.search(name))
+            elif muon_exclude_param_pattern is not None:
+                use_muon = use_muon and not bool(
+                    muon_exclude_param_pattern.search(name)
+                )
+
+            if use_muon:
+                muon_named_parameters.append((name, param))
+            else:
+                adam_named_parameters.append((name, param))
+
+        return muon_named_parameters, adam_named_parameters
+
     def __init__(self, config: Config, *, model_parts: list[nn.Module]) -> None:
-        optimizer_cls = self._resolve_optimizer_cls(config.name)
-        optimizer_kwargs = self._build_optimizer_kwargs(config)
         all_params = []
         self.optimizers = []
+        self.optimizers_by_model_part = []
         self.model_parts = model_parts
-        for model in self.model_parts:
-            param_groups = self._build_param_groups(model, config, optimizer_kwargs)
-            self.optimizers.append(optimizer_cls(param_groups))
-            for group in param_groups:
-                all_params.extend(group["params"])
+
+        if config.name == "Muon":
+            self._resolve_optimizer_cls("Muon")
+            adam_optimizer_kwargs = self._build_adam_optimizer_kwargs(config)
+            muon_optimizer_kwargs = self._build_muon_optimizer_kwargs(config)
+            bf16_state_optimizers = []
+            has_muon_params = False
+
+            for model in self.model_parts:
+                part_optimizers = []
+                (
+                    muon_named_parameters,
+                    adam_named_parameters,
+                ) = self._split_muon_named_parameters(model, config)
+
+                muon_param_groups = self._build_param_groups_from_named_parameters(
+                    muon_named_parameters,
+                    config,
+                    muon_optimizer_kwargs,
+                    warn_on_zero_matches=False,
+                )
+                if muon_param_groups:
+                    has_muon_params = True
+                    muon_optimizer = torch.optim.Muon(muon_param_groups)
+                    part_optimizers.append(muon_optimizer)
+                    for group in muon_param_groups:
+                        all_params.extend(group["params"])
+
+                adam_param_groups = self._build_param_groups_from_named_parameters(
+                    adam_named_parameters,
+                    config,
+                    adam_optimizer_kwargs,
+                    warn_on_zero_matches=False,
+                )
+                if adam_param_groups:
+                    adam_optimizer = torch.optim.AdamW(adam_param_groups)
+                    part_optimizers.append(adam_optimizer)
+                    bf16_state_optimizers.append(adam_optimizer)
+                    for group in adam_param_groups:
+                        all_params.extend(group["params"])
+
+                self.optimizers.extend(part_optimizers)
+                self.optimizers_by_model_part.append(part_optimizers)
+
+            if not has_muon_params:
+                raise ValueError(
+                    "optimizer.name='Muon' selected no 2D hidden-layer parameters. "
+                    "Check muon_param_pattern and muon_exclude_param_pattern."
+                )
+            if config.implementation == "fused_opt_states_bf16":
+                self._register_bf16_optimizer_state_hook(bf16_state_optimizers)
+            optimizer_kwargs = adam_optimizer_kwargs
+            expected_num_optimizers = sum(
+                len(part_optimizers)
+                for part_optimizers in self.optimizers_by_model_part
+            )
+        else:
+            optimizer_cls = self._resolve_optimizer_cls(config.name)
+            optimizer_kwargs = self._build_optimizer_kwargs(config)
+            for model in self.model_parts:
+                param_groups = self._build_param_groups(
+                    model, config, optimizer_kwargs
+                )
+                optimizer = optimizer_cls(param_groups)
+                self.optimizers.append(optimizer)
+                self.optimizers_by_model_part.append([optimizer])
+                for group in param_groups:
+                    all_params.extend(group["params"])
+            expected_num_optimizers = len(self.model_parts)
+
         if config.implementation == "fused_opt_states_bf16":
-            self._register_bf16_optimizer_state_hook()
-        self._validate_length(len(self.model_parts))
+            if config.name != "Muon":
+                self._register_bf16_optimizer_state_hook()
+        self._validate_length(expected_num_optimizers)
         self._post_init(all_params, optimizer_kwargs)
 
     def __iter__(self) -> Iterator[T]:
@@ -276,7 +458,7 @@ class OptimizersContainer(Optimizer, Stateful, Configurable, Generic[T]):
         )
         return {
             k: v
-            for sd in map(func, self.model_parts, self.optimizers)
+            for sd in map(func, self.model_parts, self.optimizers_by_model_part)
             for k, v in sd.items()
         }
 
@@ -286,7 +468,7 @@ class OptimizersContainer(Optimizer, Stateful, Configurable, Generic[T]):
             optim_state_dict=state_dict,
             options=StateDictOptions(flatten_optimizer_state_dict=True),
         )
-        list(map(func, self.model_parts, self.optimizers))
+        list(map(func, self.model_parts, self.optimizers_by_model_part))
 
     def _validate_length(self, expected_length: int) -> None:
         assert expected_length == len(self.optimizers), (
@@ -301,7 +483,9 @@ class OptimizersContainer(Optimizer, Stateful, Configurable, Generic[T]):
         # functionality such as hooks.
         Optimizer.__init__(self, all_params, optimizer_kwargs)
 
-    def _register_bf16_optimizer_state_hook(self) -> None:
+    def _register_bf16_optimizer_state_hook(
+        self, optimizers: list[Optimizer] | None = None
+    ) -> None:
         """Register a step pre-hook to create Adam optimizer states in bfloat16.
 
         The hook pre-populates optimizer state before Adam's lazy initialization
@@ -338,7 +522,7 @@ class OptimizersContainer(Optimizer, Stateful, Configurable, Generic[T]):
                                 memory_format=torch.preserve_format,
                             )
 
-        for optim in self.optimizers:
+        for optim in (self.optimizers if optimizers is None else optimizers):
             optim.register_step_pre_hook(_bf16_state_init_hook)
 
     def init_cache_state_dict(self) -> None:
@@ -358,6 +542,11 @@ class OptimizersInBackwardContainer(OptimizersContainer):
     @dataclass(kw_only=True, slots=True)
     class Config(OptimizersContainer.Config):
         def __post_init__(self) -> None:
+            if self.name == "Muon":
+                raise ValueError(
+                    "optimizer.name='Muon' is not supported with "
+                    "OptimizersInBackwardContainer"
+                )
             if self.implementation == "fused_opt_states_bf16":
                 raise ValueError(
                     "implementation='fused_opt_states_bf16' is not supported with "
@@ -370,6 +559,7 @@ class OptimizersInBackwardContainer(OptimizersContainer):
         optimizer_kwargs = self._build_optimizer_kwargs(config)
         all_params = []
         self.model_parts = model_parts
+        self.optimizers_by_model_part = []
 
         # Build a mapping from param -> effective kwargs using param group config
         param_to_kwargs: dict[nn.Parameter, dict[str, Any]] = {}
@@ -397,6 +587,10 @@ class OptimizersInBackwardContainer(OptimizersContainer):
                     param.register_post_accumulate_grad_hook(optim_hook)
 
         self.optimizers = list(optim_dict.values())
+        self.optimizers_by_model_part = [
+            [optim_dict[p] for p in model.parameters() if p.requires_grad]
+            for model in self.model_parts
+        ]
 
         self._validate_length(
             sum(len(list(model.parameters())) for model in self.model_parts)

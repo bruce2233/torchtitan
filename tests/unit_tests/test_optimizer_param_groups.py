@@ -49,6 +49,14 @@ def _get_param_names_in_group(model, group):
     return {param_to_name[p] for p in group["params"]}
 
 
+def _get_param_names_in_optimizer(model, optimizer):
+    """Return the set of parameter FQNs in an optimizer."""
+    names = set()
+    for group in optimizer.param_groups:
+        names.update(_get_param_names_in_group(model, group))
+    return names
+
+
 class TestParamGroupConfig(unittest.TestCase):
     def test_default_no_param_groups(self):
         """Empty param_groups produces a single group with all params."""
@@ -271,6 +279,90 @@ class TestOptimizersContainerWithParamGroups(unittest.TestCase):
         container = config.build(model_parts=[model])
         opt = container.optimizers[0]
         self.assertEqual(len(opt.param_groups), 1)
+
+
+@unittest.skipUnless(hasattr(torch.optim, "Muon"), "torch.optim.Muon unavailable")
+class TestOptimizersContainerWithMuon(unittest.TestCase):
+    def test_build_muon_splits_hidden_2d_params_to_adamw_fallback(self):
+        """Muon handles hidden 2D params; AdamW handles the rest."""
+        model = SimpleModel()
+        config = OptimizersContainer.Config(
+            name="Muon",
+            lr=1e-3,
+            weight_decay=0.1,
+            implementation="for-loop",
+        )
+
+        container = config.build(model_parts=[model])
+
+        self.assertEqual(len(container.optimizers), 2)
+        muon_opt = next(
+            opt for opt in container.optimizers if isinstance(opt, torch.optim.Muon)
+        )
+        adamw_opt = next(
+            opt for opt in container.optimizers if isinstance(opt, torch.optim.AdamW)
+        )
+
+        self.assertEqual(
+            _get_param_names_in_optimizer(model, muon_opt),
+            {
+                "layers.0.attention.weight",
+                "layers.0.ff.weight",
+            },
+        )
+
+        adamw_names = _get_param_names_in_optimizer(model, adamw_opt)
+        self.assertIn("embed_tokens.weight", adamw_names)
+        self.assertIn("output.weight", adamw_names)
+        self.assertIn("layers.0.norm.weight", adamw_names)
+        self.assertIn("layers.0.attention.bias", adamw_names)
+
+    def test_muon_param_pattern_can_narrow_selection(self):
+        """Optional regex can restrict which 2D params use Muon."""
+        model = SimpleModel()
+        config = OptimizersContainer.Config(
+            name="Muon",
+            lr=1e-3,
+            implementation="for-loop",
+            muon_param_pattern=r"attention\.weight$",
+        )
+
+        container = config.build(model_parts=[model])
+        muon_opt = next(
+            opt for opt in container.optimizers if isinstance(opt, torch.optim.Muon)
+        )
+
+        self.assertEqual(
+            _get_param_names_in_optimizer(model, muon_opt),
+            {"layers.0.attention.weight"},
+        )
+
+    def test_muon_state_dict_round_trip(self):
+        """DCP save/load works when a model part owns Muon and AdamW optimizers."""
+        model = SimpleModel()
+        config = OptimizersContainer.Config(
+            name="Muon",
+            lr=1e-3,
+            weight_decay=0.1,
+            implementation="for-loop",
+        )
+        container = config.build(model_parts=[model])
+
+        dummy_input = torch.randint(0, 32, (2, 4))
+        output = model(dummy_input)
+        output.sum().backward()
+        container.step()
+
+        state_dict = container.state_dict()
+        self.assertTrue(any("momentum_buffer" in key for key in state_dict))
+        self.assertTrue(any("exp_avg" in key for key in state_dict))
+
+        model2 = SimpleModel()
+        container2 = config.build(model_parts=[model2])
+        container2.load_state_dict(state_dict)
+
+        state_dict2 = container2.state_dict()
+        self.assertEqual(set(state_dict.keys()), set(state_dict2.keys()))
 
 
 class TestOptimizersInBackwardWithParamGroups(unittest.TestCase):
